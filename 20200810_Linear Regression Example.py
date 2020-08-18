@@ -22,6 +22,7 @@ from sklearn.datasets import load_boston
 from sklearn.model_selection import train_test_split
 
 from matplotlib import pyplot as plt
+import plotly
 from datetime import datetime
 
 import optuna
@@ -250,34 +251,43 @@ if __name__ == "__main__":
         # , sampler = optuna.samplers.TPESampler
         , pruner = optuna.pruners.MedianPruner(
             n_startup_trials = 20
-            , n_warmup_steps = 100
+            , n_warmup_steps = 500
             , interval_steps = 10
         )
     )
     # Start the optimization
     LinearRegression_Study.optimize(
         LinearRegression_Objective
-        , n_trials = 200
+        , n_trials = 300
         , n_jobs = Cores
     )
 
     # Store the pruned and complete trials
-    pruned_trials = [t for t in LinearRegression_Study.trials if t.state == optuna.structs.TrialState.PRUNED]
-    complete_trials = [t for t in LinearRegression_Study.trials if t.state == optuna.structs.TrialState.COMPLETE]
+    pruned_trials = [t for t in LinearRegression_Study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    complete_trials = [t for t in LinearRegression_Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
 
-    # # Print statistics
-    # print("Study statistics: ")
-    # print("  Number of finished trials: ", len(LinearRegression_Study.trials))
-    # print("  Number of pruned trials: ", len(pruned_trials))
-    # print("  Number of complete trials: ", len(complete_trials))
-    #
-    # print("Best trial:")
-    # Best_Trial = LinearRegression_Study.best_trial
-    #
-    # print("  Value: ", Best_Trial.value)
-    #
-    # print("  Params: ")
-    # for key, value in Best_Trial.params.items():
-    #     print("    {}: {}".format(key, value))
+    # Print statistics
+    print("Study statistics: ")
+    print("  Number of finished trials: ", len(LinearRegression_Study.trials))
+    print("  Number of pruned trials: ", len(pruned_trials))
+    print("  Number of complete trials: ", len(complete_trials))
+
+    # Store best_trial information and print it
+    Best_Trial = LinearRegression_Study.best_trial
+    print("Best trial:")
+    print("  Value: ", Best_Trial.value)
+    print("  Params: ")
+    for key, value in Best_Trial.params.items():
+        print("    {}: {}".format(key, value))
+
+# Best Test_MSE = 28.181597 - First Run
+# Best Test_MSE = 28.179186 - Second Run
+
+optuna.visualization.plot_optimization_history(LinearRegression_Study)
+optuna.visualization.plot_parallel_coordinate(LinearRegression_Study)
+
+# Seem to be getting a plotly import error for optuna.visualization
+
+
 
 # </editor-fold>
