@@ -64,6 +64,10 @@ class LinearRegression(torch.nn.Module):
         out = self.linear(X)
         return out
 
+# </editor-fold>
+
+# <editor-fold desc="Define model parameters and train">
+
 # Instantiate the model
 LinearModel = LinearRegression(
     input_size = X_Train.shape[1]
@@ -72,10 +76,6 @@ LinearModel = LinearRegression(
 
 # If GPU available then instantiate model on GPU
 LinearModel.to(Device)
-
-# </editor-fold>
-
-# <editor-fold desc="Define model parameters and train">
 
 # Define model parameters
 epochs = 10000
@@ -160,7 +160,7 @@ plt.show()
 
 # </editor-fold>
 
-# <editor-fold desc="Build LinearRegression Function and Train the model with Op">
+# <editor-fold desc="Build LinearRegression Function and Train the model with Optuna">
 
 # Define LinearRegression module
 # def LinearRegression_Model(trial):
@@ -258,7 +258,7 @@ if __name__ == "__main__":
     # Start the optimization
     LinearRegression_Study.optimize(
         LinearRegression_Objective
-        , n_trials = 300
+        , n_trials = 75
         , n_jobs = Cores
     )
 
@@ -283,11 +283,221 @@ if __name__ == "__main__":
 # Best Test_MSE = 28.181597 - First Run
 # Best Test_MSE = 28.179186 - Second Run
 
-optuna.visualization.plot_optimization_history(LinearRegression_Study)
-optuna.visualization.plot_parallel_coordinate(LinearRegression_Study)
+# Plot the optimization history
+optuna.visualization.plot_optimization_history(LinearRegression_Study).show()
+# Plot the parameter importance
+optuna.visualization.plot_param_importances(LinearRegression_Study).show()
+# Plot the parameter relationship
+optuna.visualization.plot_contour(LinearRegression_Study).show()
 
-# Seem to be getting a plotly import error for optuna.visualization
+# Save the trials_dataframe
+LinearRegression_Study_df = LinearRegression_Study.trials_dataframe()
+
+# Reconstruct optimization_history for optuna
+# def OptimizationHistoryPlot(_study: optuna.study):
+#
+#     # Store layout
+#     layout = plotly.graph_objs.Layout(
+#         title = "Optimization History Plot"
+#         , xaxis = {"title": "#Trials"}
+#         , yaxis = {"title": "Objective Value"},
+#     )
+#
+#     # Store trial
+#     trials = [t for t in _study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+#
+#     if len(trials) == 0:
+#         optuna.logging.get_logger(__name__).warning("Study instance does not contain trials.")
+#         return plotly.graph_objs.Figure(data = [], layout = layout)
+#
+#     best_values = [float("inf")] if _study.direction == optuna.study.StudyDirection.MINIMIZE else [-float("inf")]
+#     comp = min if _study.direction == optuna.study.StudyDirection.MINIMIZE else max
+#     for trial in trials:
+#         trial_value = trial.value
+#         assert trial_value is not None  # For mypy
+#         best_values.append(comp(best_values[-1], trial_value))
+#     best_values.pop(0)
+#     traces = [
+#         plotly.graph_objs.Scatter(
+#             x = [t.number for t in trials],
+#             y = [t.value for t in trials],
+#             mode = "markers",
+#             name = "Objective Value",
+#         )
+#         , plotly.graph_objs.Scatter(
+#             x = [t.number for t in trials]
+#             , y = best_values
+#             , name = "Best Value"
+#         ),
+#     ]
+#
+#     # Store the final figure
+#     figure = plotly.graph_objs.Figure(
+#         data = traces
+#         , layout = layout
+#     )
+#
+#     # Return the final figure
+#     return figure
+
+# OptimizationHistoryPlot(LinearRegression_Study).show()
 
 
+# </editor-fold>
+
+# <editor-fold desc="Build LinearRegression Function w/ Cross Validation and Train the model with Optuna">
+
+from sklearn.model_selection import KFold
+
+# Create LinearRegression with respect to multiple folds for cross-validation
+def LinearRegression_CV_Objective(trial, Train_X_Fold, Train_Y_Fold, Valid_X_Fold, Valid_Y_Fold):
+
+    # Instantiate the model and send to GPU if available
+    LinearModel = LinearRegression(
+        input_size=X_Train.shape[1]
+        , output_size=1
+    ).to(Device)
+
+    # Generate the optimizer search space
+    optimizer_name = trial.suggest_categorical('optimizer', ['SGD', 'RMSprop', 'Adam'])
+    # Generate the learning rate search space
+    learning_rate = trial.suggest_loguniform('lr', 1e-9, 1e-3)
+    # Generate the momentum search space
+    if optimizer_name in ['SGD', 'RMSprop']:
+        momentum = trial.suggest_uniform('momentum', 0.4, 0.99)
+
+    # Define the optimizer differently for non-Adam vs Adam
+    if optimizer_name in ['SGD', 'RMSprop']:
+        optimizer = getattr(optim, optimizer_name)(
+            params = LinearModel.parameters()
+            , lr = learning_rate
+            , momentum = momentum
+        )
+    else:
+        optimizer = getattr(optim, optimizer_name)(
+            params = LinearModel.parameters()
+            , lr = learning_rate
+        )
+
+    # Instantiate MSELoss as the optimizer criterion
+    criterion = torch.nn.MSELoss()
+
+    # Train the model
+    Train_MSE_Loss = []  # Instantiate MSE_Loss for model training
+    for _epoch in range(epochs):
+
+        # Convert inputs and labels to Variable make sure to convert to float first
+        _inputs = Variable(torch.from_numpy(Train_X_Fold).float().to(Device))
+        _labels = Variable(torch.from_numpy(Train_Y_Fold).float().to(Device))
+
+        # Store output from LinearModel as a function of inputs
+        _outputs = LinearModel(_inputs)
+
+        # Store the loss
+        _loss = criterion(_outputs, _labels.unsqueeze_(1))
+        Train_MSE_Loss += [_loss]
+
+        # Clear gradient buffer from previous epochs, don't want to accumulate gradients
+        optimizer.zero_grad()
+
+        # Store gradient with respect to parameters
+        _loss.backward()
+
+        # Update parameters
+        optimizer.step()
+
+        # Create predictions
+        with torch.no_grad():
+            Pred_Y = LinearModel(Variable(torch.from_numpy(Valid_X_Fold).float().to(Device))).cpu().data.numpy()
+
+        # Store Mean Squared Error
+        Valid_MSE = np.square(np.subtract(Pred_Y.reshape(Pred_Y.shape[0], ), Valid_Y_Fold)).mean()
+
+        # Report progress
+        trial.report(Valid_MSE, _epoch)
+
+        # Handle pruning based on the intermediate value.
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    # Return the model performance metric
+    return Valid_MSE
+
+# Create cross-validation objective
+def CV_Objective(trial):
+
+    # Create the Fold index
+    Fold = KFold(
+        n_splits = 5
+        , shuffle = True
+        , random_state = 10
+    )
+
+    # Instantiate list of Score
+    Scores = []
+
+    # Iterate for each fold
+    for fold_idx, (train_idx, valid_idx) in enumerate(Fold.split(range(len(X_Train)))):
+
+        # Create the various folds to feed into the model
+        # Train_X_Fold = torch.utils.data.Subset(X_Train, train_idx)
+        # Train_Y_Fold = torch.utils.data.Subset(Y_Train, train_idx)
+        # Valid_X_Fold = torch.utils.data.Subset(X_Train, valid_idx)
+        # Valid_Y_Fold = torch.utils.data.Subset(Y_Train, valid_idx)
+        Train_X_Fold, Valid_X_Fold = X_Train[train_idx], X_Train[valid_idx]
+        Train_Y_Fold, Valid_Y_Fold = Y_Train[train_idx], Y_Train[valid_idx]
+
+        # Create model for each fold
+        Valid_MSE = LinearRegression_CV_Objective(trial, Train_X_Fold, Train_Y_Fold, Valid_X_Fold, Valid_Y_Fold)
+
+        # Print fold_idx and Valid_MSE message
+        # print('CV_Fold = ' + str(fold_idx) + ' Valid_MSE = ' + str(Valid_MSE))
+
+        # Append on the Valid_MSE from each run
+        Scores.append(Valid_MSE)
+
+    # Return back the average of the cross-validated score
+    return np.mean(Scores)
+
+
+# Define model parameters
+epochs = 10000
+
+# Run the optimization
+if __name__ == "__main__":
+    # Instantiate the study
+    LinearRegression_CV_Study = optuna.create_study(
+        direction = 'minimize'
+        # , sampler = optuna.samplers.TPESampler
+        , pruner = optuna.pruners.MedianPruner(
+            n_startup_trials = 20
+            , n_warmup_steps = 500
+            , interval_steps = 10
+        )
+    )
+    # Start the optimization
+    LinearRegression_CV_Study.optimize(
+        CV_Objective
+        , n_trials = 200
+        , n_jobs = Cores
+    )
+
+    # Store the pruned and complete trials
+    pruned_trials = [t for t in LinearRegression_CV_Study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    complete_trials = [t for t in LinearRegression_CV_Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
+    # Print statistics
+    print("Study statistics: ")
+    print("  Number of finished trials: ", len(LinearRegression_CV_Study.trials))
+    print("  Number of pruned trials: ", len(pruned_trials))
+    print("  Number of complete trials: ", len(complete_trials))
+
+    # Store best_trial information and print it
+    Best_Trial = LinearRegression_CV_Study.best_trial
+    print("Best trial:")
+    print("  Value: ", Best_Trial.value)
+    print("  Params: ")
+    for key, value in Best_Trial.params.items():
+        print("    {}: {}".format(key, value))
 
 # </editor-fold>
