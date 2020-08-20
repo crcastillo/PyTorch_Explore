@@ -19,11 +19,12 @@ import torch.optim as optim
 
 import numpy as np
 from sklearn.datasets import load_boston
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 
 from matplotlib import pyplot as plt
 import plotly
 from datetime import datetime
+import pickle
 
 import optuna
 import multiprocessing
@@ -152,25 +153,24 @@ plt.plot(Pred_Y[Y_Test_idx], '--', label = 'Predict', alpha = 0.5)
 plt.legend(loc = 'best')
 plt.show()
 
-
-# TEST = torch.rand(10, 20)
-# TEST_normal_dim1 = F.normalize(input = TEST, p = 2, dim = 1) # Vector wise normalization
-# TEST_normal_dim0 = F.normalize(input = TEST, p = 2, dim = 0) # Column wise normalization
-
-
 # </editor-fold>
 
 # <editor-fold desc="Build LinearRegression Function and Train the model with Optuna">
 
-# Define LinearRegression module
-# def LinearRegression_Model(trial):
+# Split Train into X_Train_Split and X_Valid_Split
+X_Train_Split, X_Valid_Split, Y_Train_Split, Y_Valid_Split = train_test_split(
+    X_Train
+    , Y_Train
+    , test_size = 0.20
+    , random_state = 123
+)
 
 # Create objective
 def LinearRegression_Objective(trial):
 
     # Instantiate the model and send to GPU if available
     LinearModel = LinearRegression(
-        input_size = X_Train.shape[1]
+        input_size = X_Train_Split.shape[1]
         , output_size = 1
     ).to(Device)
 
@@ -203,8 +203,8 @@ def LinearRegression_Objective(trial):
     for _epoch in range(epochs):
 
         # Convert inputs and labels to Variable make sure to convert to float first
-        _inputs = Variable(torch.from_numpy(X_Train).float().to(Device))
-        _labels = Variable(torch.from_numpy(Y_Train).float().to(Device))
+        _inputs = Variable(torch.from_numpy(X_Train_Split).float().to(Device))
+        _labels = Variable(torch.from_numpy(Y_Train_Split).float().to(Device))
 
         # Store output from LinearModel as a function of inputs
         _outputs = LinearModel(_inputs)
@@ -224,20 +224,20 @@ def LinearRegression_Objective(trial):
 
         # Create predictions
         with torch.no_grad():
-            Pred_Y = LinearModel(Variable(torch.from_numpy(X_Test).float().to(Device))).cpu().data.numpy()
+            Pred_Y = LinearModel(Variable(torch.from_numpy(X_Valid_Split).float().to(Device))).cpu().data.numpy()
 
         # Store Mean Squared Error
-        Test_MSE = np.square(np.subtract(Pred_Y.reshape(Pred_Y.shape[0], ), Y_Test)).mean()
+        Valid_MSE = np.square(np.subtract(Pred_Y.reshape(Pred_Y.shape[0], ), Y_Valid_Split)).mean()
 
         # Report progress
-        trial.report(Test_MSE, _epoch)
+        trial.report(Valid_MSE, _epoch)
 
         # Handle pruning based on the intermediate value.
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
 
     # Return the model performance metric
-    return Test_MSE
+    return Valid_MSE
 
 
 # Define model parameters
@@ -250,15 +250,15 @@ if __name__ == "__main__":
         direction = 'minimize'
         # , sampler = optuna.samplers.TPESampler
         , pruner = optuna.pruners.MedianPruner(
-            n_startup_trials = 20
-            , n_warmup_steps = 500
+            n_startup_trials = 50
+            , n_warmup_steps = 1000
             , interval_steps = 10
         )
     )
     # Start the optimization
     LinearRegression_Study.optimize(
         LinearRegression_Objective
-        , n_trials = 75
+        , n_trials = 200
         , n_jobs = Cores
     )
 
@@ -280,8 +280,13 @@ if __name__ == "__main__":
     for key, value in Best_Trial.params.items():
         print("    {}: {}".format(key, value))
 
-# Best Test_MSE = 28.181597 - First Run
-# Best Test_MSE = 28.179186 - Second Run
+# Best Valid_MSE = 33.799386 - Second Run
+
+# Pickle the LinearRegression_Study
+pickle.dump(
+    obj = LinearRegression_Study
+    , file = open('Linear Regression Studies//20200820_LinearRegression_Study.sav', 'wb')
+)
 
 # Plot the optimization history
 optuna.visualization.plot_optimization_history(LinearRegression_Study).show()
@@ -346,8 +351,6 @@ LinearRegression_Study_df = LinearRegression_Study.trials_dataframe()
 # </editor-fold>
 
 # <editor-fold desc="Build LinearRegression Function w/ Cross Validation and Train the model with Optuna">
-
-from sklearn.model_selection import KFold
 
 # Create LinearRegression with respect to multiple folds for cross-validation
 def LinearRegression_CV_Objective(trial, Train_X_Fold, Train_Y_Fold, Valid_X_Fold, Valid_Y_Fold):
@@ -499,5 +502,96 @@ if __name__ == "__main__":
     print("  Params: ")
     for key, value in Best_Trial.params.items():
         print("    {}: {}".format(key, value))
+
+# Pickle the LinearRegression_CV_Study
+pickle.dump(
+    obj = LinearRegression_CV_Study
+    , file = open('Linear Regression Studies//20200820_LinearRegression_CV_Study.sav', 'wb')
+)
+
+# </editor-fold>
+
+# <editor-fold desc="Build LinearRegression_Test Function and test Validate vs CV-5 optimized models">
+
+# Create objective
+def LinearRegression_Test(Study: optuna.study.Study, X_Train, Y_Train, X_Test, Y_Test):
+
+    # Instantiate the model and send to GPU if available
+    LinearModel = LinearRegression(
+        input_size = X_Train.shape[1]
+        , output_size = 1
+    ).to(Device)
+
+    # Define the optimizer differently for non-Adam vs Adam
+    if Study.best_params['optimizer'] in ['SGD', 'RMSprop']:
+        optimizer = getattr(optim, Study.best_params['optimizer'])(
+            params = LinearModel.parameters()
+            , lr = Study.best_params['lr']
+            , momentum = Study.best_params['momentum']
+        )
+    else:
+        optimizer = getattr(optim, Study.best_params['optimizer'])(
+            params = LinearModel.parameters()
+            , lr = Study.best_params['lr']
+        )
+
+    # Instantiate MSELoss as the optimizer criterion
+    criterion = torch.nn.MSELoss()
+
+    # Train the model
+    Train_MSE_Loss = []  # Instantiate MSE_Loss for model training
+    for _epoch in range(epochs):
+
+        # Convert inputs and labels to Variable make sure to convert to float first
+        _inputs = Variable(torch.from_numpy(X_Train).float().to(Device))
+        _labels = Variable(torch.from_numpy(Y_Train).float().to(Device))
+
+        # Store output from LinearModel as a function of inputs
+        _outputs = LinearModel(_inputs)
+
+        # Store the loss
+        _loss = criterion(_outputs, _labels.unsqueeze_(1))
+        Train_MSE_Loss += [_loss]
+
+        # Clear gradient buffer from previous epochs, don't want to accumulate gradients
+        optimizer.zero_grad()
+
+        # Store gradient with respect to parameters
+        _loss.backward()
+
+        # Update parameters
+        optimizer.step()
+
+    # Create predictions
+    with torch.no_grad():
+        Pred_Y = LinearModel(Variable(torch.from_numpy(X_Test).float().to(Device))).cpu().data.numpy()
+
+    # Store Mean Squared Error
+    Test_MSE = np.square(np.subtract(Pred_Y.reshape(Pred_Y.shape[0], ), Y_Test)).mean()
+
+    # Return the model performance metric
+    return Test_MSE
+
+# Validate model Test_MSE = 28.195797
+print(
+    LinearRegression_Test(
+        Study = LinearRegression_Study
+        , X_Train = X_Train
+        , Y_Train = Y_Train
+        , X_Test = X_Test
+        , Y_Test = Y_Test
+    )
+)
+
+# CV-5 model Test_MSE = 28.191724
+print(
+    LinearRegression_Test(
+        Study = LinearRegression_CV_Study
+        , X_Train = X_Train
+        , Y_Train = Y_Train
+        , X_Test = X_Test
+        , Y_Test = Y_Test
+    )
+)
 
 # </editor-fold>
