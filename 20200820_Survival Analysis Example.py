@@ -6,7 +6,9 @@
     Initial Build: 8/20/2020
 
     Notes:
-    -
+    - Use the save_model_weights method for LogisticHazard to save the neural net model; preferable to save_net
+    - Cannot append trial.model with set_user_attrs since it's not JSON serializable
+    - Saving best current model with Callback
 """
 
 # <editor-fold desc="Import relevant modules, load dataset, split Test/Train/Valid">
@@ -25,6 +27,8 @@ from sksurv.datasets import load_whas500
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
+
+from sqlalchemy import create_engine
 
 # from matplotlib import pyplot as plt
 # import plotly
@@ -80,7 +84,6 @@ Label_Transform = LogisticHazard.label_transform(
         , dtype = float
     )
 )
-
 
 # Build transformer to alter
 get_target = lambda df: (df['duration'].values, df['event'].values)
@@ -163,7 +166,7 @@ LogHazard_Model_log = LogHazard_Model.fit(
     , val_data = (x_valid, y_valid)
 )
 
-
+# Print the minimum validation loss value
 print(LogHazard_Model_log.to_pandas().val_loss.min())
 
 # Plot the train vs validation loss
@@ -239,6 +242,9 @@ def Define_Model(trial: optuna.trial.Trial):
 # Define objective function to optimize within Optuna study
 def LogHazard_Objective(trial: optuna.trial.Trial):
 
+    # Instantiate global Best_Model
+    global _best_model
+
     # Suggest different learning rates
     lr = trial.suggest_loguniform('lr', 1e-6, 1e-2)
 
@@ -261,31 +267,65 @@ def LogHazard_Objective(trial: optuna.trial.Trial):
         , val_data = (x_valid, y_valid)
     )
 
+    # Store Model
+    _best_model = LogHazard_Model
+
     # Store the minimum validation loss
     Val_Loss_Min = min(LogHazard_Model.val_metrics.scores['loss']['score'])
 
     # Return the validation loss
     return Val_Loss_Min
 
+# tt.callbacks.EarlyStoppingCycle()
+# tt.callbacks.EarlyStopping()
+# tt.callbacks.MonitorMetrics
 
-# Run the optimization
+# TODO: Figure out how to intercept the model.fit method to prune trials
+# TODO: Find cleaner way of storing best trained model during study
+
+# Use SQLAlchemy to instantiate a RDB to store results
+Study_DB = create_engine('sqlite:///Survival Analysis Studies/20200825_LogHazard_Study.db')
+
+# Define callback to save the best_model
+def BestModelCallback(study: optuna.study.Study, trial: optuna.trial.Trial):
+    global Best_Model
+    # Boolean check to see if current trial is the best performing
+    if study.best_trial.number == trial.number:
+        # Append an attribute to the study and save the current model if best performing
+        # Best_Model.save_model_weights(
+        #     path = 'Survival Analysis Studies//20200825_LogHazard_Model_{}.sav'.format(trial.number)
+        # )
+        _best_model.save_net(
+            path = 'Survival Analysis Studies//20200825_LogHazard_Model_{}.sav'.format(trial.number)
+        )
+        Best_Model = _best_model
+
+
+# Run the optimization | no pruning since model.fit function bypasses individual steps
 if __name__ == "__main__":
     # Instantiate the study
     LogHazard_Study = optuna.create_study(
         direction = 'minimize'
         # , sampler = optuna.samplers.TPESampler()
-        , pruner = optuna.pruners.MedianPruner(
-            n_startup_trials = 20
-            , n_warmup_steps = 10
-            , interval_steps = 1
-        )
+        # , pruner = optuna.pruners.MedianPruner(
+        #     n_startup_trials = 20
+        #     , n_warmup_steps = 10
+        #     , interval_steps = 1
+        # )
+        , storage = 'sqlite:///Survival Analysis Studies/20200825_LogHazard_Study.db'
     )
     # Start the optimization
     LogHazard_Study.optimize(
         LogHazard_Objective
-        , n_trials = 200
+        , n_trials = 50
         , n_jobs = Cores
+        , callbacks = [BestModelCallback]
     )
+
+    # Save best generated model
+    LogHazard_Model_Best = Best_Model
+    # LogHazard_Model_best_net = LogHazard_Study.user_attrs['best_model_net']
+    # LogHazard_Model_best_weights = LogHazard_Study.user_attrs['best_model_weights']
 
     # Store the pruned and complete trials
     pruned_trials = [t for t in LogHazard_Study.trials if t.state == optuna.trial.TrialState.PRUNED]
@@ -294,7 +334,7 @@ if __name__ == "__main__":
     # Print statistics
     print("Study statistics: ")
     print("  Number of finished trials: ", len(LogHazard_Study.trials))
-    print("  Number of pruned trials: ", len(pruned_trials))
+    # print("  Number of pruned trials: ", len(pruned_trials))
     print("  Number of complete trials: ", len(complete_trials))
 
     # Store best_trial information and print it
@@ -312,5 +352,40 @@ pickle.dump(
     obj = LogHazard_Study
     , file = open('Survival Analysis Studies//20200824_LogHazard_Study.sav', 'wb')
 )
+
+
+# TESTING SECTION
+
+TEST_Model = LogisticHazard(
+    net = NeuralNet
+    , optimizer = tt.optim.Adam(lr = 0.01)
+    , duration_index = Label_Transform.cuts
+    , device = Device
+)
+
+TEST_Model.load_net(
+    path = 'Survival Analysis Studies//20200825_LogHazard_Model_45.sav'
+)
+
+TEST_Model_pred = TEST_Model.predict_surv_df(input = x_test)
+Best_Model_pred = Best_Model.predict_surv_df(input = x_test)
+
+TEST_test_eval = EvalSurv(
+    surv = TEST_Model_pred
+    , durations = get_target(Target_DF_Convert(Y_Test))[0]
+    , events = get_target(Target_DF_Convert(Y_Test))[1]
+    , censor_surv = 'km'
+)
+Best_test_eval = EvalSurv(
+    surv = Best_Model_pred
+    , durations = get_target(Target_DF_Convert(Y_Test))[0]
+    , events = get_target(Target_DF_Convert(Y_Test))[1]
+    , censor_surv = 'km'
+)
+
+
+print(TEST_test_eval.concordance_td())
+print(test_eval.concordance_td())
+print(Best_test_eval.concordance_td())
 
 # </editor-fold>
