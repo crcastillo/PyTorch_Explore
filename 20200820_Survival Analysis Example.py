@@ -190,6 +190,25 @@ print(test_eval.concordance_td())
 
 # <editor-fold desc="Use Optuna to hypertune the LogisticHazard model and create predictions">
 
+# Create Callback class to attempt end of epoch trial.prune
+class Callback_Prune(tt.callbacks._ActionOnBestMetric):
+    def __init__(self, trial: optuna.trial.Trial, metric='loss', dataset='val', get_score=None):
+        super().__init__(metric, dataset, get_score)
+        self._trial = trial
+        self._epoch = -1
+
+    def on_epoch_end(self):
+        # Advance _epoch by 1
+        self._epoch += 1
+        # Retrieve the current val score
+        score = self.get_score()
+        # Report score to trial
+        self._trial.report(value = score, step = self._epoch)
+        # Run pruning boolean
+        if self._trial.should_prune():
+            message = 'Trial was pruned at iteration {}.'.format(self._epoch)
+            raise optuna.TrialPruned(message)
+
 # Define function that will optimize hidden layers, in/out features, dropout ratio
 def Define_Model(trial: optuna.trial.Trial):
 
@@ -262,7 +281,7 @@ def LogHazard_Objective(trial: optuna.trial.Trial):
         , target = y_train
         , batch_size = 40
         , epochs = 200
-        , callbacks = [tt.callbacks.EarlyStopping()]
+        , callbacks = [tt.callbacks.EarlyStopping(), Callback_Prune(trial)]
         , verbose = False
         , val_data = (x_valid, y_valid)
     )
@@ -276,15 +295,13 @@ def LogHazard_Objective(trial: optuna.trial.Trial):
     # Return the validation loss
     return Val_Loss_Min
 
-# tt.callbacks.EarlyStoppingCycle()
-# tt.callbacks.EarlyStopping()
-# tt.callbacks.MonitorMetrics
 
-# TODO: Figure out how to intercept the model.fit method to prune trials
+
+# TODO: Figure out how to prevent the weight_checkpoint saving from the Callback_Prune
 # TODO: Find cleaner way of storing best trained model during study
 
 # Use SQLAlchemy to instantiate a RDB to store results
-Study_DB = create_engine('sqlite:///Survival Analysis Studies/20200825_LogHazard_Study.db')
+Study_DB = create_engine('sqlite:///Survival Analysis Studies/20200827_LogHazard_Study.db')
 
 # Define callback to save the best_model
 def BestModelCallback(study: optuna.study.Study, trial: optuna.trial.Trial):
@@ -296,7 +313,7 @@ def BestModelCallback(study: optuna.study.Study, trial: optuna.trial.Trial):
         #     path = 'Survival Analysis Studies//20200825_LogHazard_Model_{}.sav'.format(trial.number)
         # )
         _best_model.save_net(
-            path = 'Survival Analysis Studies//20200825_LogHazard_Model_{}.sav'.format(trial.number)
+            path = 'Survival Analysis Studies//20200827_LogHazard_Model_{}.sav'.format(trial.number)
         )
         Best_Model = _best_model
 
@@ -306,18 +323,18 @@ if __name__ == "__main__":
     # Instantiate the study
     LogHazard_Study = optuna.create_study(
         direction = 'minimize'
-        # , sampler = optuna.samplers.TPESampler()
-        # , pruner = optuna.pruners.MedianPruner(
-        #     n_startup_trials = 20
-        #     , n_warmup_steps = 10
-        #     , interval_steps = 1
-        # )
-        , storage = 'sqlite:///Survival Analysis Studies/20200825_LogHazard_Study.db'
+        , sampler = optuna.samplers.TPESampler(seed = Random_Seed)
+        , pruner = optuna.pruners.MedianPruner(
+            n_startup_trials = 10
+            , n_warmup_steps = 1
+            , interval_steps = 1
+        )
+        , storage = 'sqlite:///Survival Analysis Studies/20200827_LogHazard_Study.db'
     )
     # Start the optimization
     LogHazard_Study.optimize(
         LogHazard_Objective
-        , n_trials = 50
+        , n_trials = 20
         , n_jobs = Cores
         , callbacks = [BestModelCallback]
     )
@@ -334,7 +351,7 @@ if __name__ == "__main__":
     # Print statistics
     print("Study statistics: ")
     print("  Number of finished trials: ", len(LogHazard_Study.trials))
-    # print("  Number of pruned trials: ", len(pruned_trials))
+    print("  Number of pruned trials: ", len(pruned_trials))
     print("  Number of complete trials: ", len(complete_trials))
 
     # Store best_trial information and print it
