@@ -9,6 +9,7 @@
     - Use the save_model_weights method for LogisticHazard to save the neural net model; preferable to save_net
     - Cannot append trial.model with set_user_attrs since it's not JSON serializable
     - Saving best current model with Callback
+    - Cannot stop model_weights checkpoint file from persisting after a Trial has been pruned, oh well...
 """
 
 # <editor-fold desc="Import relevant modules, load dataset, split Test/Train/Valid">
@@ -16,19 +17,22 @@
 import torch
 from torch.autograd import Variable
 import torch.optim as optim
+
 import torchtuples as tt
 from pycox.models import LogisticHazard
 from pycox.evaluation import EvalSurv
 
 import numpy as np
-import pandas as pd
 from sksurv.datasets import load_whas500
 
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, MetaData, Table
+from sqlalchemy.orm import sessionmaker
+import pandas as pd
+
 
 # from matplotlib import pyplot as plt
 # import plotly
@@ -190,24 +194,59 @@ print(test_eval.concordance_td())
 
 # <editor-fold desc="Use Optuna to hypertune the LogisticHazard model and create predictions">
 
+# Taking on class of StopIfExplodeOrNan doesn't work
+# Trying rebuilding the EarlyStopping Class to include Pruning
+# Doesn't work either, the model_weights file persists no matter what
+# class EarlyStopping_With_Prune(tt.callbacks._ActionOnBestMetric):
+#     def __init__(self, trial: optuna.trial.Trial, metric='loss', dataset='val', get_score=None, minimize=True, min_delta=0.,
+#                  patience=10, checkpoint_model=True, file_path=None, load_best=True, rm_file=True):
+#         self.patience = patience
+#         self.trial = trial
+#         self.epoch = -1
+#         super().__init__(metric, dataset, get_score, minimize, min_delta, checkpoint_model,
+#                          file_path, load_best, rm_file)
+#
+#     def on_epoch_end(self):
+#         super().on_epoch_end()
+#         # Advance _epoch by 1
+#         self.epoch += 1
+#         # Retrieve the current val score
+#         self.score = self.model.log.monitors['val_'].scores[self.metric]['score'][-1]
+#         # Report score to trial
+#         self.trial.report(value=self.score, step=self.epoch)
+#         # Check whether should prune
+#         should_prune = self.trial.should_prune()
+#         # Run pruning boolean
+#         if should_prune:
+#             message = 'Trial was pruned at iteration {}.'.format(self.epoch)
+#             raise optuna.TrialPruned(message)
+#         return self._iter_since_best >= self.patience or should_prune
+
+# Simplest build, likely best
+# Can't seem to remove duplicated unnecessary weights file...
 # Create Callback class to attempt end of epoch trial.prune
-class Callback_Prune(tt.callbacks._ActionOnBestMetric):
-    def __init__(self, trial: optuna.trial.Trial, metric='loss', dataset='val', get_score=None):
-        super().__init__(metric, dataset, get_score)
-        self._trial = trial
-        self._epoch = -1
+class Callback_Prune(tt.callbacks.Callback):
+    def __init__(self, trial: optuna.trial.Trial, metric='loss'):
+        self.trial = trial
+        self.epoch = -1
+        self.metric = metric
 
     def on_epoch_end(self):
         # Advance _epoch by 1
-        self._epoch += 1
+        self.epoch += 1
         # Retrieve the current val score
-        score = self.get_score()
+        self.score = self.model.log.monitors['val_'].scores[self.metric]['score'][-1]
         # Report score to trial
-        self._trial.report(value = score, step = self._epoch)
+        self.trial.report(value=self.score, step=self.epoch)
+        # Check whether should prune
+        self.should_prune = self.trial.should_prune()
         # Run pruning boolean
-        if self._trial.should_prune():
-            message = 'Trial was pruned at iteration {}.'.format(self._epoch)
+        if self.should_prune:
+            # print(self.file_path)
+            message = 'Trial was pruned at iteration {}.'.format(self.epoch)
             raise optuna.TrialPruned(message)
+        return self.should_prune
+
 
 # Define function that will optimize hidden layers, in/out features, dropout ratio
 def Define_Model(trial: optuna.trial.Trial):
@@ -281,7 +320,10 @@ def LogHazard_Objective(trial: optuna.trial.Trial):
         , target = y_train
         , batch_size = 40
         , epochs = 200
-        , callbacks = [tt.callbacks.EarlyStopping(), Callback_Prune(trial)]
+        , callbacks = [
+            tt.callbacks.EarlyStopping()
+            , Callback_Prune(trial)
+        ]
         , verbose = False
         , val_data = (x_valid, y_valid)
     )
@@ -295,9 +337,6 @@ def LogHazard_Objective(trial: optuna.trial.Trial):
     # Return the validation loss
     return Val_Loss_Min
 
-
-
-# TODO: Figure out how to prevent the weight_checkpoint saving from the Callback_Prune
 # TODO: Find cleaner way of storing best trained model during study
 
 # Use SQLAlchemy to instantiate a RDB to store results
@@ -308,15 +347,11 @@ def BestModelCallback(study: optuna.study.Study, trial: optuna.trial.Trial):
     global Best_Model
     # Boolean check to see if current trial is the best performing
     if study.best_trial.number == trial.number:
-        # Append an attribute to the study and save the current model if best performing
-        # Best_Model.save_model_weights(
-        #     path = 'Survival Analysis Studies//20200825_LogHazard_Model_{}.sav'.format(trial.number)
-        # )
+        # Save the current model if best performing
         _best_model.save_net(
             path = 'Survival Analysis Studies//20200827_LogHazard_Model_{}.sav'.format(trial.number)
         )
         Best_Model = _best_model
-
 
 # Run the optimization | no pruning since model.fit function bypasses individual steps
 if __name__ == "__main__":
@@ -325,8 +360,8 @@ if __name__ == "__main__":
         direction = 'minimize'
         , sampler = optuna.samplers.TPESampler(seed = Random_Seed)
         , pruner = optuna.pruners.MedianPruner(
-            n_startup_trials = 10
-            , n_warmup_steps = 1
+            n_startup_trials = 20
+            , n_warmup_steps = 20
             , interval_steps = 1
         )
         , storage = 'sqlite:///Survival Analysis Studies/20200827_LogHazard_Study.db'
@@ -334,7 +369,7 @@ if __name__ == "__main__":
     # Start the optimization
     LogHazard_Study.optimize(
         LogHazard_Objective
-        , n_trials = 20
+        , n_trials = 100
         , n_jobs = Cores
         , callbacks = [BestModelCallback]
     )
@@ -364,45 +399,89 @@ if __name__ == "__main__":
 
 # Best Valid_Loss = 3.807277
 
-# Pickle the LogHazard_Study
-pickle.dump(
-    obj = LogHazard_Study
-    , file = open('Survival Analysis Studies//20200824_LogHazard_Study.sav', 'wb')
+# Pickle the LogHazard_Study | no longer necessary as Study is stored in Sqlite3 DB
+# pickle.dump(
+#     obj = LogHazard_Study
+#     , file = open('Survival Analysis Studies//20200824_LogHazard_Study.sav', 'wb')
+# )
+
+
+# <editor-fold desc="Access LogHazard_Study.db and evaluate key tables">
+
+# Connect to db
+SQLite_DB = create_engine('sqlite:///Survival Analysis Studies/20200827_LogHazard_Study.db')
+
+# Instantiate MetaData object
+DB_MetaData = MetaData(bind = SQLite_DB)
+
+# Automap the existing tables
+DB_MetaData.reflect()
+
+# Create factory for session objects bound to db
+Session = sessionmaker(bind = SQLite_DB)
+
+# Create session object
+session = Session()
+
+# Display tables
+print(DB_MetaData.tables.keys())
+
+# Convert Trials to schema table
+Trials = Table(
+    'trials'
+    , DB_MetaData
+    , autoload = True
+    , autoload_with = SQLite_DB
 )
 
-
-# TESTING SECTION
-
-TEST_Model = LogisticHazard(
-    net = NeuralNet
-    , optimizer = tt.optim.Adam(lr = 0.01)
-    , duration_index = Label_Transform.cuts
-    , device = Device
+# Convert Trials to schema table
+Trial_Params = Table(
+    'trial_params'
+    , DB_MetaData
+    , autoload = True
+    , autoload_with = SQLite_DB
 )
 
-TEST_Model.load_net(
-    path = 'Survival Analysis Studies//20200825_LogHazard_Model_45.sav'
+# Convert Trials into dataframe
+Trial_Params_df = pd.read_sql(
+    sql = session.query(Trial_Params).statement
+    , con = session.bind
 )
 
-TEST_Model_pred = TEST_Model.predict_surv_df(input = x_test)
-Best_Model_pred = Best_Model.predict_surv_df(input = x_test)
+# </editor-fold>
 
-TEST_test_eval = EvalSurv(
-    surv = TEST_Model_pred
-    , durations = get_target(Target_DF_Convert(Y_Test))[0]
-    , events = get_target(Target_DF_Convert(Y_Test))[1]
-    , censor_surv = 'km'
-)
-Best_test_eval = EvalSurv(
-    surv = Best_Model_pred
-    , durations = get_target(Target_DF_Convert(Y_Test))[0]
-    , events = get_target(Target_DF_Convert(Y_Test))[1]
-    , censor_surv = 'km'
-)
+# TESTING SECTION | Commenting out
 
-
-print(TEST_test_eval.concordance_td())
-print(test_eval.concordance_td())
-print(Best_test_eval.concordance_td())
+# TEST_Model = LogisticHazard(
+#     net = NeuralNet
+#     , optimizer = tt.optim.Adam(lr = 0.01)
+#     , duration_index = Label_Transform.cuts
+#     , device = Device
+# )
+#
+# TEST_Model.load_net(
+#     path = 'Survival Analysis Studies//20200825_LogHazard_Model_45.sav'
+# )
+#
+# TEST_Model_pred = TEST_Model.predict_surv_df(input = x_test)
+# Best_Model_pred = Best_Model.predict_surv_df(input = x_test)
+#
+# TEST_test_eval = EvalSurv(
+#     surv = TEST_Model_pred
+#     , durations = get_target(Target_DF_Convert(Y_Test))[0]
+#     , events = get_target(Target_DF_Convert(Y_Test))[1]
+#     , censor_surv = 'km'
+# )
+# Best_test_eval = EvalSurv(
+#     surv = Best_Model_pred
+#     , durations = get_target(Target_DF_Convert(Y_Test))[0]
+#     , events = get_target(Target_DF_Convert(Y_Test))[1]
+#     , censor_surv = 'km'
+# )
+#
+#
+# print(TEST_test_eval.concordance_td())
+# print(test_eval.concordance_td())
+# print(Best_test_eval.concordance_td())
 
 # </editor-fold>
