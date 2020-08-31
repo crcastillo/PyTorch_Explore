@@ -357,19 +357,24 @@ def BestModelCallback(study: optuna.study.Study, trial: optuna.trial.Trial):
 if __name__ == "__main__":
     # Instantiate the study
     LogHazard_Study = optuna.create_study(
-        direction = 'minimize'
-        , sampler = optuna.samplers.TPESampler(seed = Random_Seed)
+        study_name = 'LogisticHazard'
+        , direction = 'minimize'
+        , sampler = optuna.samplers.TPESampler(
+            seed = Random_Seed
+            , consider_endpoints=True
+        )
         , pruner = optuna.pruners.MedianPruner(
             n_startup_trials = 20
             , n_warmup_steps = 20
-            , interval_steps = 1
+            , interval_steps = 5
         )
         , storage = 'sqlite:///Survival Analysis Studies/20200827_LogHazard_Study.db'
+        , load_if_exists = True
     )
     # Start the optimization
     LogHazard_Study.optimize(
         LogHazard_Objective
-        , n_trials = 100
+        , n_trials = 50
         , n_jobs = Cores
         , callbacks = [BestModelCallback]
     )
@@ -434,7 +439,7 @@ Trials = Table(
     , autoload_with = SQLite_DB
 )
 
-# Convert Trials to schema table
+# Convert Trial_Params to schema table
 Trial_Params = Table(
     'trial_params'
     , DB_MetaData
@@ -443,8 +448,8 @@ Trial_Params = Table(
 )
 
 # Convert Trials into dataframe
-Trial_Params_df = pd.read_sql(
-    sql = session.query(Trial_Params).statement
+Trials_df = pd.read_sql(
+    sql = session.query(Trials).statement
     , con = session.bind
 )
 
