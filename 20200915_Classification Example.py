@@ -12,6 +12,7 @@
 # <editor-fold desc="Import relevant modules, load dataset, split Test/Train/Valid">
 
 import torch
+import pytorch_lightning as pl
 
 import pandas as pd
 import numpy as np
@@ -27,7 +28,6 @@ import multiprocessing
 import importlib
 import datetime
 
-import pytorch_lightning as pl
 import plotly.express as px
 # from datetime import datetime
 # import pickle
@@ -38,6 +38,7 @@ Random_Seed = 123
 Test_Proportion = 0.2
 Cores = np.int(multiprocessing.cpu_count() / 2)
 Device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+batch_size = 64
 
 # Import PreProcessing module
 MyModule = importlib.import_module('PreProcessing')
@@ -123,8 +124,12 @@ train_data = Data_Transform(X=x_train, y=Y_Train_Split)
 valid_data = Data_Transform(X=x_valid, y=Y_Valid_Split)
 test_data = Data_Transform(X=x_test, y=Y_Test)
 
-# </editor-fold>
+# Create the DataLoaders
+train_dl = torch.utils.data.DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
+valid_dl = torch.utils.data.DataLoader(dataset=valid_data, batch_size=32, shuffle=False)
+test_dl = torch.utils.data.DataLoader(dataset=test_data, batch_size=32, shuffle=False)
 
+# </editor-fold>
 
 # <editor-fold desc="Create NeuralNet class and define model architecture">
 
@@ -159,19 +164,12 @@ NN_Model = NeuralNet()
 
 # Define the model parameters
 epochs = 1000
-batch_size = 64
 learning_rate = 1e-3
 criterion = torch.nn.BCELoss()
 optimizer = torch.optim.SGD(
     params=NN_Model.parameters()
     ,lr=learning_rate
 )
-
-# Create the DataLoaders
-
-train_dl = torch.utils.data.DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
-valid_dl = torch.utils.data.DataLoader(dataset=valid_data, batch_size=32, shuffle=False)
-test_dl = torch.utils.data.DataLoader(dataset=test_data, batch_size=32, shuffle=False)
 
 # If GPU available then instantiate model on GPU
 NN_Model.to(Device)
@@ -269,8 +267,6 @@ print('Average Precision Score = {:.4f}'.format(average_precision_score(y_true=A
 
 # </editor-fold>
 
-
-# TODO: Create PyTorch Lightning build and train it
 # <editor-fold desc="Recreate the model with PyTorch-Lightning Module">
 
 # Create the class
@@ -294,25 +290,83 @@ class NN_Lit_Model(pl.LightningModule):
     def forward(self, x):
         x = torch.nn.functional.relu(self.Linear1(x))
         x = torch.nn.functional.relu(self.Linear2(x))
-        return torch.sigmoid(self.Linear3(x))
+        x = torch.sigmoid(self.Linear3(x))
+        return x
     # Define optimizer
     def configure_optimizers(self):
-        return torch.optim.SGD(params=self.parameters(),lr=1e-3)
+        return torch.optim.SGD(params=self.parameters(),lr=1e-2)
     # Define the training step
     def training_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self(x), target=y)
-        return {'loss':loss, 'log': {'train_loss':loss}}
+        result = pl.TrainResult(loss)
+        result.log('train_loss', loss)
+        return result
     # Define the validation step
     def validation_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self(x), target=y)
-        return {'loss': loss, 'log': {'valid_loss': loss}}
+        result = pl.EvalResult(
+            checkpoint_on=loss
+            , early_stop_on=loss
+        )
+        result.log('val_loss', loss)
+        return result
 
+# Instantiate the model
+NN_Lit_Model_Test = NN_Lit_Model()
 
+# Instantiate the Trainer
+Trainer = pl.Trainer(
+    gpus=[Device]
+    , max_epochs=1000
+    , early_stop_callback=pl.callbacks.EarlyStopping(
+        patience=10
+        , verbose=True
+        # , monitor='val_loss' # Not necessary since specified in validation_step
+    )
+    , checkpoint_callback=pl.callbacks.ModelCheckpoint(
+        filepath='Classifier Checkpoint/'
+        # , monitor='val_loss'
+        , verbose=True
+        , save_top_k=3
+    )
+    , progress_bar_refresh_rate=1
+    , default_root_dir='Classifier Checkpoint/'
+)
 
+# Fit the model
+Trainer.fit(
+    model=NN_Lit_Model_Test
+    , train_dataloader=train_dl
+    , val_dataloaders=valid_dl
+)
 
+# Save trained model object
+NN_Lit_Model_trained = NN_Lit_Model_Test
 
+# Save the configuration for inference/prediction
+NN_Lit_Model_trained.freeze()
+
+# TODO: Figure out the source of the illegal memory access error
+
+# Make sure we can get a prediction out | success
+NN_Lit_Model_trained(torch.randn(42).to(Device))
+
+# Score Test data
+Pred = np.array([])
+Actual = np.array([])
+for _inputs, _targets in test_dl:
+    # Load inputs to GPU
+    _inputs_t = _inputs.to(Device)
+    # Compute model output
+    _yhat = NN_Lit_Model_trained(_inputs_t)
+    # Append predictions and targets
+    Pred = np.append(Pred, _yhat.cpu().data.numpy())
+    Actual = np.append(Actual, _targets.cpu().data.numpy())
+# Determine AUC and Average Precision Score
+print('AUC = {:.4f}'.format(roc_auc_score(y_true=Actual, y_score=Pred)))
+print('Average Precision Score = {:.4f}'.format(average_precision_score(y_true=Actual, y_score=Pred)))
 
 # </editor-fold>
 
