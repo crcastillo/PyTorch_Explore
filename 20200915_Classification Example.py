@@ -13,12 +13,13 @@
 
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import CSVLogger
 
 import pandas as pd
 import numpy as np
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
 
 from sqlalchemy import create_engine, MetaData, Table
 from sqlalchemy.orm import sessionmaker
@@ -317,10 +318,16 @@ class NN_Lit_Model(pl.LightningModule):
 # Instantiate the model
 NN_Lit_Model_Test = NN_Lit_Model()
 
+# # Save PyTorch Lightning object
+# torch.save(NN_Lit_Model_Test, f='./Classify_Example_PL_net.sav')
+
+# # Test the load functionality
+# TEST = torch.load(f='./Classify_Example_PL_net.sav')
+
 # Instantiate the Trainer
 Trainer = pl.Trainer(
     gpus=[Device]
-    , max_epochs=1000
+    , max_epochs=250
     , early_stop_callback=pl.callbacks.EarlyStopping(
         patience=10
         , verbose=True
@@ -458,8 +465,9 @@ def NNet_Objective(trial):
     TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
         filepath=os.path.join(
             'Classifier Studies/'
-            ,'trial_{}'.format(trial.number)
-            , '_{epoch}'
+            , '20201001_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , '{epoch}'
         )
         , monitor='avg_val_loss'
     )
@@ -468,17 +476,32 @@ def NNet_Objective(trial):
 
     # Instantiate the PyTorch Lightning Trainer
     PL_Trainer = pl.Trainer(
-        logger=False
+        logger=CSVLogger(save_dir=os.path.join(
+            'Classifier Studies/'
+            , '20201001_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        ))
         , checkpoint_callback=TrialCheckpointCallback
-        , max_epochs=250
+        , max_epochs=300
         , gpus=[Device]
         , callbacks=[Metrics_Callback]
         , early_stop_callback=optuna.integration.PyTorchLightningPruningCallback(trial, monitor='avg_val_loss')
-        , progress_bar_refresh_rate=0
+        , progress_bar_refresh_rate=200
     )
 
     # Instantiate the PyTorch Lightning module
     Model = NNet_Lightning(trial)
+
+    # Save Model architecture to respective trial folder
+    torch.save(
+        obj=Model
+        , f=os.path.join(
+            'Classifier Studies/'
+            , '20201001_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , 'Model.sav'
+        )
+    )
 
     # Use Trainer to fit the model
     PL_Trainer.fit(
@@ -492,7 +515,7 @@ def NNet_Objective(trial):
 
 
 # Use SQLAlchemy to instantiate a RDB to store results
-Study_DB = create_engine('sqlite:///Classifier Studies/20200929_Classifier_Study.db')
+Study_DB = create_engine('sqlite:///Classifier Studies/20201001_Classifier_Study/20201001_Classifier_Study.db')
 
 # Run the optimization | no pruning since model.fit function bypasses individual steps
 if __name__ == "__main__":
@@ -509,7 +532,7 @@ if __name__ == "__main__":
             , n_warmup_steps = 20
             , interval_steps = 5
         )
-        , storage = 'sqlite:///Classifier Studies/20200930_Classifier_Study.db'
+        , storage = 'sqlite:///Classifier Studies/20201001_Classifier_Study/20201001_Classifier_Study.db'
         , load_if_exists = True
     )
     # Start the optimization
@@ -531,12 +554,62 @@ if __name__ == "__main__":
 
     # Store best_trial information and print it
     Best_Trial = Classifier_Study.best_trial
-    print("Best trial:")
+    print("Best Trial = {}:".format(Best_Trial.number))
     print("  Value: ", Best_Trial.value)
     print("  Params: ")
     for key, value in Best_Trial.params.items():
         print("    {}: {}".format(key, value))
 
-# Best Avg Valid_Loss = ?
+# Best Avg Valid_Loss = 0.?
+
+# </editor-fold>
+
+# <editor-fold desc="Load up the best model and check against valid_dl">
+
+# Load up best model checkpoint and model object
+Best_Model_Checkpoint = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_0/epoch=249.ckpt')
+Best_Model = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_0/Model.sav')
+
+# Store a randomly generated tensor
+torch.manual_seed(Random_Seed)
+Random_Vector = torch.randn(x_train.shape[1])
+
+# Check output from original weights
+Best_Model.eval()
+print(Best_Model(Random_Vector))
+
+# Load the state_dict which includes weights
+Best_Model.load_state_dict(Best_Model_Checkpoint['state_dict'])
+
+# Check output from updated weights
+Best_Model.eval()
+print(Best_Model(Random_Vector))
+
+# Print the Best Model score from callback checkpoint
+torch.set_printoptions(precision=16)
+print(Best_Model_Checkpoint['checkpoint_callback_best_model_score'].cpu())
+
+# Double check
+Pred = np.array([])
+Actual = np.array([])
+BCE = np.array([])
+for _inputs, _targets in valid_dl:
+    # Set model for inference by freezing the weights
+    Best_Model.freeze()
+    # Load inputs to CPU
+    _inputs_t = _inputs.to('cpu')
+    # Compute model output
+    _yhat = Best_Model(_inputs_t)
+    # Send to cpu
+    _yhat = _yhat.cpu().data.numpy()
+    _targets = _targets.cpu().data.numpy()
+    # Append binary cross entropy, predictions, and targets
+    BCE = np.append(BCE, log_loss(y_pred=_yhat, y_true=_targets, labels=[0, 1]))
+    Pred = np.append(Pred, _yhat)
+    Actual = np.append(Actual, _targets)
+
+# Display the average binary cross entropy
+print(BCE.mean())
+print(log_loss(y_pred=Pred, y_true=Actual))
 
 # </editor-fold>
