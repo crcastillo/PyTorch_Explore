@@ -567,8 +567,8 @@ if __name__ == "__main__":
 # <editor-fold desc="Load up the best model and check against valid_dl">
 
 # Load up best model checkpoint and model object
-Best_Model_Checkpoint = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_0/epoch=249.ckpt')
-Best_Model = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_0/Model.sav')
+Best_Model_Checkpoint = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_39/epoch=266.ckpt')
+Best_Model = torch.load(f='Classifier Studies/20201001_Classifier_Study/trial_39/Model.sav')
 
 # Store a randomly generated tensor
 torch.manual_seed(Random_Seed)
