@@ -6,14 +6,14 @@
     Initial Build: 9/15/2020
 
     Notes:
-    -
+    - Updated for pytorch-lightning 1.0.2
 """
 
 # <editor-fold desc="Import relevant modules, load dataset, split Test/Train/Valid">
 
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 import pandas as pd
 import numpy as np
@@ -126,10 +126,13 @@ train_data = Data_Transform(X=x_train, y=Y_Train_Split)
 valid_data = Data_Transform(X=x_valid, y=Y_Valid_Split)
 test_data = Data_Transform(X=x_test, y=Y_Test)
 
-# Create the DataLoaders
-train_dl = torch.utils.data.DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
-valid_dl = torch.utils.data.DataLoader(dataset=valid_data, batch_size=32, shuffle=False)
-test_dl = torch.utils.data.DataLoader(dataset=test_data, batch_size=32, shuffle=False)
+# Create the DataLoaders, num_workers = 0 since not loading from physical location
+train_dl = torch.utils.data.DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True
+                                       , num_workers = 0, pin_memory = False)
+valid_dl = torch.utils.data.DataLoader(dataset=valid_data, batch_size=32, shuffle=False
+                                       , num_workers = 0, pin_memory = False)
+test_dl = torch.utils.data.DataLoader(dataset=test_data, batch_size=32, shuffle=False
+                                      , num_workers = 0, pin_memory = False)
 
 # </editor-fold>
 
@@ -301,19 +304,18 @@ class NN_Lit_Model(pl.LightningModule):
     def training_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self(x), target=y)
-        result = pl.TrainResult(loss)
-        result.log('train_loss', loss)
-        return result
+        self.log(name='train_loss', value=loss, prog_bar=False)
+        return loss
     # Define the validation step
     def validation_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self(x), target=y)
-        result = pl.EvalResult(
-            checkpoint_on=loss
-            , early_stop_on=loss
-        )
-        result.log('val_loss', loss)
-        return result
+        self.log(name='batch_val_loss', value=loss, prog_bar=True)
+        return {'batch_val_loss': loss}
+    # Define the validation step
+    def validation_epoch_end(self, outputs):
+        avg_loss = sum([x["batch_val_loss"] for x in outputs]) / len(outputs)
+        self.log('avg_val_loss', value=avg_loss, prog_bar=True)
 
 # Instantiate the model
 NN_Lit_Model_Test = NN_Lit_Model()
@@ -327,20 +329,36 @@ NN_Lit_Model_Test = NN_Lit_Model()
 # Instantiate the Trainer
 Trainer = pl.Trainer(
     gpus=[Device]
-    , max_epochs=250
-    , early_stop_callback=pl.callbacks.EarlyStopping(
-        patience=10
-        , verbose=True
-        # , monitor='val_loss' # Not necessary since specified in validation_step
+    # , logger=CSVLogger(save_dir=os.path.join(
+    #         'Classifier Checkpoint/'
+    #         , '20201016/'
+    #     )
+    # )
+    , logger=TensorBoardLogger(
+        save_dir=os.path.join(
+            'Classifier Checkpoint/'
+            , '20201016/'
+        )
     )
+    , max_epochs=250
+    , callbacks=[
+        pl.callbacks.EarlyStopping(
+            patience=10
+            , verbose=False
+            , monitor='avg_val_loss'
+            , mode='min'
+        )
+    ]
     , checkpoint_callback=pl.callbacks.ModelCheckpoint(
-        filepath='Classifier Checkpoint/'
-        # , monitor='val_loss'
+        filepath='Classifier Checkpoint/20201016/'
+        , monitor='avg_val_loss'
         , verbose=True
         , save_top_k=3
     )
-    , progress_bar_refresh_rate=1
-    , default_root_dir='Classifier Checkpoint/'
+    # Can't seem to log the gpu memory usage
+    # , log_gpu_memory=str('all')
+    , progress_bar_refresh_rate=20
+    , default_root_dir='Classifier Checkpoint/20201016/'
 )
 
 # Fit the model
@@ -383,6 +401,65 @@ print('Average Precision Score = {:.4f}'.format(average_precision_score(y_true=A
 # </editor-fold>
 
 # <editor-fold desc="Use Optuna to hypertune the NeuralNet_Lit model and create predictions">
+
+def Run_Study(study_db: str, study_name: str, objective_fx, direction: str, n_trials: int, n_jobs: int
+    , n_startup_trials = 20, n_warmup_steps = 20, interval_steps = 1, seed = None #, study_path = str
+    ):
+    # Validate inputs
+    if direction not in ['maximize', 'minimize']:
+        raise ValueError("direction must be in ['maximize', 'minimize']")
+
+    if __name__ == "__main__":
+        # Use SQLAlchemy to instantiate a RDB to store results
+        Study_DB = create_engine(study_db)
+
+        # Instantiate study to record results | successive trials can be added to existing
+        Study = optuna.create_study(
+            study_name=study_name
+            , direction=direction
+            , storage=study_db
+            , sampler=optuna.samplers.TPESampler(
+                seed=seed
+                , consider_endpoints=True
+            )
+            , pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=n_startup_trials
+                , n_warmup_steps=n_warmup_steps
+                , interval_steps=interval_steps
+            )
+            , load_if_exists=True
+        )
+
+        # Parallelize optimization over defined cores and ensure the best model is saved
+        Study.optimize(
+            func=objective_fx
+            , n_trials=n_trials
+            , n_jobs=n_jobs
+            , show_progress_bar=False
+            , gc_after_trial=True
+        )
+
+        # Store the pruned and complete trials
+        pruned_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.PRUNED]
+        complete_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
+        # Print statistics
+        print("Study statistics: ")
+        print("  Number of finished trials: ", len(Study.trials))
+        print("  Number of pruned trials: ", len(pruned_trials))
+        print("  Number of complete trials: ", len(complete_trials))
+
+        # Display best configuration and best score
+        print('Best Trial = {}'.format(Study.best_trial._number))
+        print('Best Trial Score = {:6f}'.format(Study.best_value))
+        print(Study.best_params)
+
+        # Return a dictionary with the key results from the study
+        return {
+            'Best_Trial': Study.best_trial._number
+            , 'Best_Score': Study.best_value
+            , 'Best_Params': Study.best_params
+        }
 
 # Construct the neural net class
 class NNet(torch.nn.Module):
@@ -440,16 +517,18 @@ class NNet_Lightning(pl.LightningModule):
     def training_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
-        return {'loss': loss}
+        self.log('loss', loss)
+        return loss
     # Define the validation step
     def validation_step(self, batch, batch_nb):
         x, y = batch
         loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
+        self.log('batch_val_loss', loss)
         return {'batch_val_loss': loss}
     # Define the validation post epoch end step
     def validation_epoch_end(self, outputs):
-        avg_loss = sum(x["batch_val_loss"] for x in outputs) / len(outputs)
-        return {"log": {"avg_val_loss": avg_loss}}
+        avg_val_loss = sum(x["batch_val_loss"] for x in outputs) / len(outputs)
+        self.log('avg_val_loss', avg_val_loss, prog_bar=True)
 
 # Create PyTorch Lightning metric callback
 class MetricsCallback(pl.Callback):
@@ -461,11 +540,20 @@ class MetricsCallback(pl.Callback):
 
 # Define objective function to optimize within Optuna study
 def NNet_Objective(trial):
+    # Ensure directory is created for each trial of study
+    os.mkdir(
+        path=os.path.join(
+            'Classifier Studies/'
+            , '20201016_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        )
+    )
+
     # Create trial model checkpoint
     TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
         filepath=os.path.join(
             'Classifier Studies/'
-            , '20201001_Classifier_Study/'
+            , '20201016_Classifier_Study/'
             , 'trial_{}'.format(trial.number)
             , '{epoch}'
         )
@@ -478,14 +566,22 @@ def NNet_Objective(trial):
     PL_Trainer = pl.Trainer(
         logger=CSVLogger(save_dir=os.path.join(
             'Classifier Studies/'
-            , '20201001_Classifier_Study/'
+            , '20201016_Classifier_Study/'
             , 'trial_{}'.format(trial.number)
         ))
         , checkpoint_callback=TrialCheckpointCallback
-        , max_epochs=300
+        , max_epochs=500
         , gpus=[Device]
-        , callbacks=[Metrics_Callback]
-        , early_stop_callback=optuna.integration.PyTorchLightningPruningCallback(trial, monitor='avg_val_loss')
+        , callbacks=[
+            Metrics_Callback
+            , pl.callbacks.EarlyStopping(
+                patience=10
+                , verbose=False
+                , mode='min'
+                , monitor='avg_val_loss'
+            )
+            , optuna.integration.PyTorchLightningPruningCallback(trial, monitor='avg_val_loss')
+        ]
         , progress_bar_refresh_rate=200
     )
 
@@ -497,7 +593,7 @@ def NNet_Objective(trial):
         obj=Model
         , f=os.path.join(
             'Classifier Studies/'
-            , '20201001_Classifier_Study/'
+            , '20201016_Classifier_Study/'
             , 'trial_{}'.format(trial.number)
             , 'Model.sav'
         )
@@ -513,52 +609,19 @@ def NNet_Objective(trial):
     # Return the average validation loss
     return Metrics_Callback.metrics[-1]['avg_val_loss'].item()
 
-
-# Use SQLAlchemy to instantiate a RDB to store results
-Study_DB = create_engine('sqlite:///Classifier Studies/20201001_Classifier_Study/20201001_Classifier_Study.db')
-
-# Run the optimization | no pruning since model.fit function bypasses individual steps
-if __name__ == "__main__":
-    # Instantiate the study
-    Classifier_Study = optuna.create_study(
-        study_name = 'Classifier'
-        , direction = 'minimize'
-        , sampler = optuna.samplers.TPESampler(
-            seed = Random_Seed
-            , consider_endpoints=True
-        )
-        , pruner = optuna.pruners.MedianPruner(
-            n_startup_trials = 20
-            , n_warmup_steps = 20
-            , interval_steps = 5
-        )
-        , storage = 'sqlite:///Classifier Studies/20201001_Classifier_Study/20201001_Classifier_Study.db'
-        , load_if_exists = True
-    )
-    # Start the optimization
-    Classifier_Study.optimize(
-        NNet_Objective
-        , n_trials = 50
-        , n_jobs = Cores
-    )
-
-    # Store the pruned and complete trials
-    pruned_trials = [t for t in Classifier_Study.trials if t.state == optuna.trial.TrialState.PRUNED]
-    complete_trials = [t for t in Classifier_Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-
-    # Print statistics
-    print("Study statistics: ")
-    print("  Number of finished trials: ", len(Classifier_Study.trials))
-    print("  Number of pruned trials: ", len(pruned_trials))
-    print("  Number of complete trials: ", len(complete_trials))
-
-    # Store best_trial information and print it
-    Best_Trial = Classifier_Study.best_trial
-    print("Best Trial = {}:".format(Best_Trial.number))
-    print("  Value: ", Best_Trial.value)
-    print("  Params: ")
-    for key, value in Best_Trial.params.items():
-        print("    {}: {}".format(key, value))
+# Run the study
+Classifier_Study = Run_Study(
+    study_name='Classifier'
+    , study_db='sqlite:///Classifier Studies/20201016_Classifier_Study/20201016_Classifier_Study.db'
+    , objective_fx=NNet_Objective
+    , direction = 'minimize'
+    , n_trials=50
+    , n_jobs=Cores
+    , n_startup_trials=20
+    , n_warmup_steps=20
+    , interval_steps=1
+    , seed=Random_Seed
+)
 
 # Best Avg Valid_Loss = 0.?
 
