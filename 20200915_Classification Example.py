@@ -14,6 +14,7 @@
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from pytorch_lightning.metrics.functional.classification import auroc
 
 import pandas as pd
 import numpy as np
@@ -133,6 +134,79 @@ valid_dl = torch.utils.data.DataLoader(dataset=valid_data, batch_size=32, shuffl
                                        , num_workers = 0, pin_memory = False)
 test_dl = torch.utils.data.DataLoader(dataset=test_data, batch_size=32, shuffle=False
                                       , num_workers = 0, pin_memory = False)
+
+# </editor-fold>
+
+# <editor-fold desc="Create functions">
+
+# Create Optuna Study function
+def Run_Study(study_db: str, study_name: str, objective_fx, direction: str, n_trials: int, n_jobs: int
+    , n_startup_trials = 20, n_warmup_steps = 20, interval_steps = 1, seed = None #, study_path = str
+    ):
+    # Validate inputs
+    if direction not in ['maximize', 'minimize']:
+        raise ValueError("direction must be in ['maximize', 'minimize']")
+
+    if __name__ == "__main__":
+        # Use SQLAlchemy to instantiate a RDB to store results
+        Study_DB = create_engine(study_db)
+
+        # Instantiate study to record results | successive trials can be added to existing
+        Study = optuna.create_study(
+            study_name=study_name
+            , direction=direction
+            , storage=study_db
+            , sampler=optuna.samplers.TPESampler(
+                seed=seed
+                , consider_endpoints=True
+            )
+            , pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=n_startup_trials
+                , n_warmup_steps=n_warmup_steps
+                , interval_steps=interval_steps
+            )
+            , load_if_exists=True
+        )
+
+        # Parallelize optimization over defined cores and ensure the best model is saved
+        Study.optimize(
+            func=objective_fx
+            , n_trials=n_trials
+            , n_jobs=n_jobs
+            , show_progress_bar=False
+            , gc_after_trial=True
+        )
+
+        # Store the pruned and complete trials
+        pruned_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.PRUNED]
+        complete_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
+        # Print statistics
+        print("Study statistics: ")
+        print("  Number of finished trials: ", len(Study.trials))
+        print("  Number of pruned trials: ", len(pruned_trials))
+        print("  Number of complete trials: ", len(complete_trials))
+
+        # Display best configuration and best score
+        print('Best Trial = {}'.format(Study.best_trial._number))
+        print('Best Trial Score = {:6f}'.format(Study.best_value))
+        print(Study.best_params)
+
+        # Return a dictionary with the key results from the study
+        return {
+            'Best_Trial': Study.best_trial._number
+            , 'Best_Score': Study.best_value
+            , 'Best_Params': Study.best_params
+        }
+
+
+# Create PyTorch Lightning metric callback
+class MetricsCallback(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.metrics = []
+    def on_validation_end(self, trainer, pl_module):
+        self.metrics.append(trainer.callback_metrics)
 
 # </editor-fold>
 
@@ -402,65 +476,6 @@ print('Average Precision Score = {:.4f}'.format(average_precision_score(y_true=A
 
 # <editor-fold desc="Use Optuna to hypertune the NeuralNet_Lit model and create predictions">
 
-def Run_Study(study_db: str, study_name: str, objective_fx, direction: str, n_trials: int, n_jobs: int
-    , n_startup_trials = 20, n_warmup_steps = 20, interval_steps = 1, seed = None #, study_path = str
-    ):
-    # Validate inputs
-    if direction not in ['maximize', 'minimize']:
-        raise ValueError("direction must be in ['maximize', 'minimize']")
-
-    if __name__ == "__main__":
-        # Use SQLAlchemy to instantiate a RDB to store results
-        Study_DB = create_engine(study_db)
-
-        # Instantiate study to record results | successive trials can be added to existing
-        Study = optuna.create_study(
-            study_name=study_name
-            , direction=direction
-            , storage=study_db
-            , sampler=optuna.samplers.TPESampler(
-                seed=seed
-                , consider_endpoints=True
-            )
-            , pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=n_startup_trials
-                , n_warmup_steps=n_warmup_steps
-                , interval_steps=interval_steps
-            )
-            , load_if_exists=True
-        )
-
-        # Parallelize optimization over defined cores and ensure the best model is saved
-        Study.optimize(
-            func=objective_fx
-            , n_trials=n_trials
-            , n_jobs=n_jobs
-            , show_progress_bar=False
-            , gc_after_trial=True
-        )
-
-        # Store the pruned and complete trials
-        pruned_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.PRUNED]
-        complete_trials = [t for t in Study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-
-        # Print statistics
-        print("Study statistics: ")
-        print("  Number of finished trials: ", len(Study.trials))
-        print("  Number of pruned trials: ", len(pruned_trials))
-        print("  Number of complete trials: ", len(complete_trials))
-
-        # Display best configuration and best score
-        print('Best Trial = {}'.format(Study.best_trial._number))
-        print('Best Trial Score = {:6f}'.format(Study.best_value))
-        print(Study.best_params)
-
-        # Return a dictionary with the key results from the study
-        return {
-            'Best_Trial': Study.best_trial._number
-            , 'Best_Score': Study.best_value
-            , 'Best_Params': Study.best_params
-        }
-
 # Construct the neural net class
 class NNet(torch.nn.Module):
     def __init__(self, trial):
@@ -674,5 +689,175 @@ for _inputs, _targets in valid_dl:
 # Display the average binary cross entropy
 print(BCE.mean())
 print(log_loss(y_pred=Pred, y_true=Actual))
+
+# </editor-fold>
+
+# <editor-fold desc="Use Optuna to hypertune the NeuralNet_Lit model using AUROC">
+
+# Construct the neural net class
+class NNet(torch.nn.Module):
+    def __init__(self, trial):
+        super(NNet, self).__init__()
+        self.layers = []
+        self.dropouts = []
+
+        # Optimize the number of hidden layers, hidden units, and dropout percentages
+        n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 3)
+        input_features = x_train.shape[1]
+        output_features_max = input_features * 2 - 1
+
+        # Append hidden layers and dropouts
+        for _i in range(n_hidden_layers):
+            # Store potential out_features
+            output_features = trial.suggest_int('n_units_l{}'.format(_i), low=4, high=output_features_max, log=True)
+            # Append a hidden layer
+            self.layers.append(torch.nn.Linear(in_features=input_features, out_features=output_features))
+            # Suggest a proportion for Dropout
+            p = trial.suggest_uniform("dropout_l{}".format(_i), 0.05, 0.5)
+            # Dropout layer, which randomly zeroes some proportion of the elements
+            self.dropouts.append(torch.nn.Dropout(p=p))
+            # Set input_features accordingly so any new layers take on the input dimension from the last output dimension
+            input_features = output_features
+        # Append final layer
+        self.layers.append(torch.nn.Linear(in_features=input_features, out_features=1))
+        # Assigning the layers as class variables (PyTorch requirement)
+        for idx, layer in enumerate(self.layers):
+            setattr(self, "fc{}".format(idx), layer)
+        # Assigning the dropouts as class variables (PyTorch requirement)
+        for idx, dropout in enumerate(self.dropouts):
+            setattr(self, "drop{}".format(idx), dropout)
+    # Define the forward pass
+    def forward(self, x):
+        for layer, dropout in zip(self.layers, self.dropouts):
+            x = torch.relu(layer(x))
+            x = dropout(x)
+        return torch.sigmoid(self.layers[-1](x))
+
+# Create the PyTorch Lightning class
+class NNet_Lightning(pl.LightningModule):
+    def __init__(self, trial):
+        super(NNet_Lightning, self).__init__()
+        self.model = NNet(trial)
+        # Suggest different learning rates
+        self.lr = trial.suggest_loguniform('lr', 1e-6, 1e-1)
+    # Define the forward pass output
+    def forward(self, x):
+        return self.model(x)
+    # Define optimizer
+    def configure_optimizers(self):
+        return torch.optim.SGD(params=self.model.parameters(),lr=self.lr)
+    # Define the training step
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
+        self.log('loss', loss)
+        return loss
+    def on_validation_epoch_start(self):
+        self.val_output = torch.cuda.FloatTensor()
+        self.val_target = torch.cuda.FloatTensor()
+    # Define the validation step
+    def validation_step(self, batch, batch_nb):
+        x, y = batch
+        loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
+        self.val_output = torch.cat((self.val_output, self.forward(x)), dim=0)
+        self.val_target = torch.cat((self.val_target, y), dim=0)
+        self.log('batch_val_loss', loss)
+        return {'batch_val_loss': loss}
+    # Define the validation post epoch end step
+    def validation_epoch_end(self, outputs):
+        avg_val_loss = sum(x["batch_val_loss"] for x in outputs) / len(outputs)
+        self.log('avg_val_loss', avg_val_loss, prog_bar=True)
+        val_auroc = auroc(
+            pred=self.val_output.view(-1)
+            , target=self.val_target.view(-1)
+        )
+        self.log('val_auroc', val_auroc, prog_bar=True)
+
+# Define objective function to optimize within Optuna study
+def NNet_Objective(trial):
+    # Ensure directory is created for each trial of study
+    os.mkdir(
+        path=os.path.join(
+            'Classifier Studies/'
+            , '20201017_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        )
+    )
+
+    # Create trial model checkpoint
+    TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
+        filepath=os.path.join(
+            'Classifier Studies/'
+            , '20201017_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , '{epoch}'
+        )
+        , monitor='val_auroc'
+    )
+    # Instantiate the MetricsCallback
+    Metrics_Callback = MetricsCallback()
+
+    # Instantiate the PyTorch Lightning Trainer
+    PL_Trainer = pl.Trainer(
+        logger=CSVLogger(save_dir=os.path.join(
+            'Classifier Studies/'
+            , '20201017_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        ))
+        , checkpoint_callback=TrialCheckpointCallback
+        , max_epochs=5
+        , gpus=[Device]
+        , callbacks=[
+            Metrics_Callback
+            , pl.callbacks.EarlyStopping(
+                patience=10
+                , verbose=False
+                , mode='maximize'
+                , monitor='val_auroc'
+            )
+            , optuna.integration.PyTorchLightningPruningCallback(trial, monitor='val_auroc')
+        ]
+        , progress_bar_refresh_rate=0
+    )
+
+    # Instantiate the PyTorch Lightning module
+    Model = NNet_Lightning(trial)
+
+    # Save Model architecture to respective trial folder
+    torch.save(
+        obj=Model
+        , f=os.path.join(
+            'Classifier Studies/'
+            , '20201017_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , 'Model.sav'
+        )
+    )
+
+    # Use Trainer to fit the model
+    PL_Trainer.fit(
+        model=Model
+        , train_dataloader=train_dl
+        , val_dataloaders=valid_dl
+    )
+
+    # Return the average validation loss
+    return Metrics_Callback.metrics[-1]['val_auroc'].item()
+
+# Run the study
+Classifier_Study = Run_Study(
+    study_name='Classifier'
+    , study_db='sqlite:///Classifier Studies/20201017_Classifier_Study/20201017_Classifier_Study.db'
+    , objective_fx=NNet_Objective
+    , direction = 'maximize'
+    , n_trials=50
+    , n_jobs=Cores
+    , n_startup_trials=20
+    , n_warmup_steps=20
+    , interval_steps=1
+    , seed=Random_Seed
+)
+
+# Best Avg Valid_Loss = 0.?
 
 # </editor-fold>
