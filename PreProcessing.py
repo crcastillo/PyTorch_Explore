@@ -16,7 +16,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import VarianceThreshold
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder, MinMaxScaler
 from sklearn.impute import SimpleImputer
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
@@ -302,6 +302,58 @@ class VIFScreen(BaseEstimator, TransformerMixin):
         # Create a copy of the matrix without highly correlated columns
         return X.T[~self.Remove_Vector].T
 
+# Create custom transformer identifies columns that has missing values and creates new column with a missing value
+# indicator
+class IndicateMissing(TransformerMixin, BaseEstimator):
+    def __init__(self, missing_values=np.nan):
+        self.missing_values = missing_values
+
+    def fit(self, X, y = None):
+        # Instantiate list to store columns that contain NaN
+        self.NaN_Columns = []
+        # Iterate through all columns looking for ones that contain a NaN (or NA)
+        for col in X.columns:
+            if X[col].isna().sum() > 0:
+                self.NaN_Columns.append(col)
+        return self
+
+    def transform(self, X, y = None):
+        # Create a copy of the dataframe
+        X_Copy = X.copy()
+        # Iterate through self.category_levels to set levels accordingly and coerce new levels to NaN
+        for col in self.NaN_Columns:
+            # Store a copy of the field and set the category levels according to fit
+            NaN_Check = X_Copy[col].isna().astype('category')
+            # Overwrite the transformed field
+            X_Copy[str(col + '_NaN')] = NaN_Check
+        # Return the copied DataFrame
+        return X_Copy
+
+# Create custom transformer that can perform label encoding and store the classes in a callable dictionary
+class ModifiedLabelEncoder(TransformerMixin, BaseEstimator):
+    def __init__(self):
+        self
+
+    def fit(self, X, y = None):
+        # Instantiate dictionary to store label encoders that we'll fit
+        self.labels_dict = {}
+        # Iterate through all columns looking for ones that contain a NaN (or NA)
+        for col in range(X.shape[1]):
+            self.labels_dict[col] = LabelEncoder().fit(X[:,col])
+        return self
+
+    def transform(self, X, y = None):
+        # Create a copy of the dataframe
+        X_Copy = X.copy()
+        # Iterate through self.category_levels to set levels accordingly and coerce new levels to NaN
+        for key in self.labels_dict.keys():
+            # Store a copy of the field and set the category levels according to fit
+            Transform_Field = self.labels_dict[key].transform(X_Copy[:,key])
+            # Overwrite the transformed field
+            X_Copy[:,key] = Transform_Field
+        # Return the copied DataFrame
+        return X_Copy
+
 # </editor-fold>
 
 # <editor-fold desc="Define final Numeric/Categorical transformers for Pipeline">
@@ -393,5 +445,96 @@ Pipeline_PreProcessing = Pipeline(
     ]
     , verbose = True
 )
+
+# </editor-fold>
+
+# <editor-fold desc="Build function that instantiates a PreProcessing Pipeline">
+
+def CreatePreProcessingPipeline(verbose = False):
+    # Define Numeric transformations
+    Numeric_Transformer = Pipeline(
+        steps = [
+            ('SimpleImputer with median', SimpleImputer(
+                strategy = 'median'
+                , verbose = 1))
+            , ('Remove highly intra-correlated fields' , FindCorrelation(threshold = 0.95))
+            # , ('Run VIF screen' ,VIFScreen(threshold = 10.0))
+            , ('StandardScaler', StandardScaler())
+        ]
+        , verbose = verbose
+    )
+    # Define Numeric transformations
+    Categorical_Transformer = Pipeline(
+        steps = [
+            ('SimpleImputer with most_frequent', SimpleImputer(
+                strategy = 'most_frequent'
+                , verbose = 1))
+            , ('LabelEncoder', ModifiedLabelEncoder())
+            , ('OneHotEncoding', OneHotEncoder(
+                handle_unknown = 'error'
+                , drop = 'first'
+                , sparse = False))
+        ]
+        , verbose = verbose
+    )
+    # Combine the Numeric and Categorical transformers
+    Combined_Transformer = ColumnTransformer(
+        transformers = [
+            ('Numeric transformations'
+             , Numeric_Transformer
+             , make_column_selector(dtype_include = np.number))
+            , ('Categorical transformations'
+               , Categorical_Transformer
+               , make_column_selector(dtype_include = 'category'))
+        ]
+        , remainder = 'passthrough'
+    )
+
+    # Craft a Pre-Processing Model Pipeline
+    Pipeline_PreProcessing = Pipeline(
+        steps = [
+            # ('Convert specified fields to str', ObjectConversion_Manual(
+            #     Object_List = [
+            #         'bDeath'
+            #     ]))
+            # ,
+            ('Remove high missing fields', FeatureMissingness(cutoff = 0.95))
+            , ('Transform defined numerical fields with log(x + 1)' , LogPlusOne_Manual(
+                Transform_Fields = [
+                    'duration'
+                ]))
+            , ('Set defined categorical levels to NaN', NA_Manual(
+                NA_Manual_Dict = {
+                    'pdays': [
+                        -1
+                    ]
+                })
+               )
+            # , ('Fill the NA records for defined fields', Fill_NA_Manual(
+            #     Fill_NA_Dict = {
+            #         'Annuity_Count' : 0
+            #     })
+            #    )
+            # , ('Remove defined fields', HardExclude(
+            #     Exclude_Fields = [
+            #         'ID'
+            #         , 'chBIO_UserType'  # Low variance since this just equals Client
+            #     ])
+            #    )
+            # , ('Coerce categorical fields with low observation counts to _Other_' , LowObsCounts_Manual(
+            #     Fill_Other_Dict = {
+            #         'chBIO_Occupation': 0.005
+            #     })
+            #    )
+            , ('Convert all object fields to category fields', CategoryConverter())
+            , ('Coerce novel categorical levels to NaN', NewCategoryLevels())
+            , ('MissingValueIndicator' , IndicateMissing())
+            , ('Numeric/Categorical transforms', Combined_Transformer)
+            , ('Variance screen' , VarianceThreshold(threshold = 0))
+        ]
+        , verbose = verbose
+    )
+
+    return Pipeline_PreProcessing
 
 # </editor-fold>

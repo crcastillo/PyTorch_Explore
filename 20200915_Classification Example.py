@@ -35,6 +35,7 @@ import plotly.express as px
 # from datetime import datetime
 # import pickle
 
+import PreProcessing
 
 # Set parameters
 Random_Seed = 123
@@ -42,11 +43,6 @@ Test_Proportion = 0.2
 Cores = np.int(multiprocessing.cpu_count() / 2)
 Device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 batch_size = 64
-
-# Import PreProcessing module
-MyModule = importlib.import_module('PreProcessing')
-# MyModule = importlib.reload(importlib.import_module('PreProcessing'))
-PreProcessing = MyModule.Pipeline_PreProcessing
 
 # Import bank-marketing dataset, target is whether client subscribed to a term deposit
 Data_X, Data_Y = fetch_openml(
@@ -94,10 +90,13 @@ X_Train_Split, X_Valid_Split, Y_Train_Split, Y_Valid_Split = train_test_split(
     , test_size = Test_Proportion
 )
 
+# Instantiate PreProcessing Pipeline
+Processing = PreProcessing.CreatePreProcessingPipeline(verbose=True)
+
 # Fit and transform feature matrices
-x_train = PreProcessing.fit_transform(X = X_Train_Split).astype('float32')
-x_valid = PreProcessing.transform(X = X_Valid_Split).astype('float32')
-x_test = PreProcessing.transform(X = X_Test).astype('float32')
+x_train = Processing.fit_transform(X = X_Train_Split).astype('float32')
+x_valid = Processing.transform(X = X_Valid_Split).astype('float32')
+x_test = Processing.transform(X = X_Test).astype('float32')
 
 # # Define training data class
 # class trainData(torch.utils.data.Dataset):
@@ -199,14 +198,31 @@ def Run_Study(study_db: str, study_name: str, objective_fx, direction: str, n_tr
             , 'Best_Params': Study.best_params
         }
 
-
 # Create PyTorch Lightning metric callback
 class MetricsCallback(pl.Callback):
-    def __init__(self):
+    def __init__(self, monitor: str, mode: str):
         super().__init__()
         self.metrics = []
-    def on_validation_end(self, trainer, pl_module):
-        self.metrics.append(trainer.callback_metrics)
+        self.best_metric = None
+        self.monitor = monitor
+        self.mode = mode
+        # Validate the direction
+        if self.mode not in ['max', 'min']:
+            raise ValueError("mode must be in ['max', 'min']")
+
+    # def on_validation_end(self, trainer, pl_module):
+    def on_epoch_end(self, trainer, pl_module):
+        self.metrics.append(trainer.callback_metrics.copy())
+        # Overwrite best_metric
+        if self.best_metric == None:
+            self.best_metric = self.metrics[-1][self.monitor]
+        elif self.mode == 'max':
+            if self.metrics[-1][self.monitor] > self.best_metric:
+                self.best_metric = self.metrics[-1][self.monitor]
+        else:
+            if self.metrics[-1][self.monitor] < self.best_metric:
+                self.best_metric = self.metrics[-1][self.monitor]
+
 
 # </editor-fold>
 
@@ -388,35 +404,38 @@ class NN_Lit_Model(pl.LightningModule):
         return {'batch_val_loss': loss}
     # Define the validation step
     def validation_epoch_end(self, outputs):
-        avg_loss = sum([x["batch_val_loss"] for x in outputs]) / len(outputs)
+        avg_loss = torch.stack([x["batch_val_loss"] for x in outputs]).mean()
         self.log('avg_val_loss', value=avg_loss, prog_bar=True)
 
 # Instantiate the model
 NN_Lit_Model_Test = NN_Lit_Model()
 
-# # Save PyTorch Lightning object
-# torch.save(NN_Lit_Model_Test, f='./Classify_Example_PL_net.sav')
+# Instantiate the BestMetricCallback
+# BestMetricCallback = BestMetricCallback(monitor='avg_val_loss', mode='min')
 
-# # Test the load functionality
-# TEST = torch.load(f='./Classify_Example_PL_net.sav')
+# Instantiate MetricsCallback
+# MetricCallback_Test = MetricCallback()
+
+MetricsCallback_Inst = MetricsCallback(monitor='avg_val_loss', mode='min')
 
 # Instantiate the Trainer
 Trainer = pl.Trainer(
     gpus=[Device]
-    # , logger=CSVLogger(save_dir=os.path.join(
-    #         'Classifier Checkpoint/'
-    #         , '20201016/'
-    #     )
-    # )
-    , logger=TensorBoardLogger(
-        save_dir=os.path.join(
+    , logger=CSVLogger(save_dir=os.path.join(
             'Classifier Checkpoint/'
             , '20201016/'
         )
     )
-    , max_epochs=250
+    # , logger=TensorBoardLogger(
+    #     save_dir=os.path.join(
+    #         'Classifier Checkpoint/'
+    #         , '20201016/'
+    #     )
+    # )
+    , max_epochs=4
     , callbacks=[
-        pl.callbacks.EarlyStopping(
+        MetricsCallback_Inst
+        , pl.callbacks.EarlyStopping(
             patience=10
             , verbose=False
             , monitor='avg_val_loss'
@@ -427,11 +446,11 @@ Trainer = pl.Trainer(
         filepath='Classifier Checkpoint/20201016/'
         , monitor='avg_val_loss'
         , verbose=True
-        , save_top_k=3
+        , save_top_k=2
     )
     # Can't seem to log the gpu memory usage
     # , log_gpu_memory=str('all')
-    , progress_bar_refresh_rate=20
+    , progress_bar_refresh_rate=0
     , default_root_dir='Classifier Checkpoint/20201016/'
 )
 
@@ -447,8 +466,6 @@ NN_Lit_Model_trained = NN_Lit_Model_Test
 
 # Save the configuration for inference/prediction
 NN_Lit_Model_trained.freeze()
-
-# TODO: Figure out the source of the illegal memory access error
 
 # Make sure we can get a prediction out | success
 NN_Lit_Model_trained.to('cpu')
@@ -542,19 +559,14 @@ class NNet_Lightning(pl.LightningModule):
         return {'batch_val_loss': loss}
     # Define the validation post epoch end step
     def validation_epoch_end(self, outputs):
-        avg_val_loss = sum(x["batch_val_loss"] for x in outputs) / len(outputs)
+        avg_val_loss = torch.stack([x["batch_val_loss"] for x in outputs]).mean()
         self.log('avg_val_loss', avg_val_loss, prog_bar=True)
-
-# Create PyTorch Lightning metric callback
-class MetricsCallback(pl.Callback):
-    def __init__(self):
-        super().__init__()
-        self.metrics = []
-    def on_validation_end(self, trainer, pl_module):
-        self.metrics.append(trainer.callback_metrics)
 
 # Define objective function to optimize within Optuna study
 def NNet_Objective(trial):
+    # Instantiate the MetricsCallback
+    MetricsCallback_Inst = MetricsCallback(monitor='avg_val_loss', mode='min')
+
     # Ensure directory is created for each trial of study
     os.mkdir(
         path=os.path.join(
@@ -574,8 +586,6 @@ def NNet_Objective(trial):
         )
         , monitor='avg_val_loss'
     )
-    # Instantiate the MetricsCallback
-    Metrics_Callback = MetricsCallback()
 
     # Instantiate the PyTorch Lightning Trainer
     PL_Trainer = pl.Trainer(
@@ -585,10 +595,10 @@ def NNet_Objective(trial):
             , 'trial_{}'.format(trial.number)
         ))
         , checkpoint_callback=TrialCheckpointCallback
-        , max_epochs=500
+        , max_epochs=200
         , gpus=[Device]
         , callbacks=[
-            Metrics_Callback
+            MetricsCallback_Inst
             , pl.callbacks.EarlyStopping(
                 patience=10
                 , verbose=False
@@ -597,7 +607,7 @@ def NNet_Objective(trial):
             )
             , optuna.integration.PyTorchLightningPruningCallback(trial, monitor='avg_val_loss')
         ]
-        , progress_bar_refresh_rate=200
+        , progress_bar_refresh_rate=100
     )
 
     # Instantiate the PyTorch Lightning module
@@ -621,8 +631,8 @@ def NNet_Objective(trial):
         , val_dataloaders=valid_dl
     )
 
-    # Return the average validation loss
-    return Metrics_Callback.metrics[-1]['avg_val_loss'].item()
+    # Return the best average validation loss
+    return MetricsCallback_Inst.best_metric.item()
 
 # Run the study
 Classifier_Study = Run_Study(
@@ -630,7 +640,7 @@ Classifier_Study = Run_Study(
     , study_db='sqlite:///Classifier Studies/20201016_Classifier_Study/20201016_Classifier_Study.db'
     , objective_fx=NNet_Objective
     , direction = 'minimize'
-    , n_trials=50
+    , n_trials=20
     , n_jobs=Cores
     , n_startup_trials=20
     , n_warmup_steps=20
@@ -795,7 +805,7 @@ def NNet_Objective(trial):
         , monitor='val_auroc'
     )
     # Instantiate the MetricsCallback
-    Metrics_Callback = MetricsCallback()
+    Metrics_Callback = MetricsCallback(monitor='val_auroc', mode='max')
 
     # Instantiate the PyTorch Lightning Trainer
     PL_Trainer = pl.Trainer(
@@ -841,8 +851,8 @@ def NNet_Objective(trial):
         , val_dataloaders=valid_dl
     )
 
-    # Return the average validation loss
-    return Metrics_Callback.metrics[-1]['val_auroc'].item()
+    # Return the best auroc score from all epochs
+    return Metrics_Callback.best_metric.item()
 
 # Run the study
 Classifier_Study = Run_Study(
