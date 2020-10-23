@@ -40,7 +40,7 @@ import PreProcessing
 # Set parameters
 Random_Seed = 123
 Test_Proportion = 0.2
-Cores = np.int(multiprocessing.cpu_count() / 2)
+Cores = np.int(multiprocessing.cpu_count() / 4)
 Device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 batch_size = 64
 
@@ -861,6 +861,190 @@ Classifier_Study = Run_Study(
     , objective_fx=NNet_Objective
     , direction = 'maximize'
     , n_trials=50
+    , n_jobs=Cores
+    , n_startup_trials=20
+    , n_warmup_steps=20
+    , interval_steps=1
+    , seed=Random_Seed
+)
+
+# Best Avg Valid_Loss = 0.?
+
+# </editor-fold>
+
+# <editor-fold desc="Try out BCEWithLogitLoss and optimize with Optuna">
+
+# Construct the neural net class
+class NNet(torch.nn.Module):
+    def __init__(self, trial):
+        super(NNet, self).__init__()
+        self.layers = []
+        self.dropouts = []
+
+        # Optimize the number of hidden layers, hidden units, and dropout percentages
+        n_hidden_layers = trial.suggest_int('n_hidden_layers', 1, 3)
+        input_features = x_train.shape[1]
+        output_features_max = input_features * 2 - 1
+
+        # Append hidden layers and dropouts
+        for _i in range(n_hidden_layers):
+            # Store potential out_features
+            output_features = trial.suggest_int('n_units_l{}'.format(_i), low=4, high=output_features_max, log=True)
+            # Append a hidden layer
+            self.layers.append(torch.nn.Linear(in_features=input_features, out_features=output_features))
+            # Suggest a proportion for Dropout
+            p = trial.suggest_uniform("dropout_l{}".format(_i), 0.05, 0.5)
+            # Dropout layer, which randomly zeroes some proportion of the elements
+            self.dropouts.append(torch.nn.Dropout(p=p))
+            # Set input_features accordingly so any new layers take on the input dimension from the last output dimension
+            input_features = output_features
+        # Append final layer
+        self.layers.append(torch.nn.Linear(in_features=input_features, out_features=1))
+        # Assigning the layers as class variables (PyTorch requirement)
+        for idx, layer in enumerate(self.layers):
+            setattr(self, "fc{}".format(idx), layer)
+        # Assigning the dropouts as class variables (PyTorch requirement)
+        for idx, dropout in enumerate(self.dropouts):
+            setattr(self, "drop{}".format(idx), dropout)
+    # Define the forward pass | altered to remove sigmoid activation
+    def forward(self, x):
+        for layer, dropout in zip(self.layers, self.dropouts):
+            x = torch.relu(layer(x))
+            x = dropout(x)
+        return self.layers[-1](x)
+
+# Create the PyTorch Lightning class
+class NNet_Lightning(pl.LightningModule):
+    def __init__(self, trial):
+        super(NNet_Lightning, self).__init__()
+        self.model = NNet(trial)
+        # Suggest different learning rates
+        self.lr = trial.suggest_loguniform('lr', 1e-6, 1e-1)
+    # Define the forward pass output
+    def forward(self, x):
+        return self.model(x)
+    # Define optimizer
+    def configure_optimizers(self):
+        return torch.optim.SGD(params=self.model.parameters(),lr=self.lr)
+    # Define the training step
+    def training_step(self, batch, batch_nb):
+        x, y = batch
+        # loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(input=self.forward(x), target=y)
+        self.log('loss', loss)
+        return loss
+    def on_validation_epoch_start(self):
+        self.val_output = torch.cuda.FloatTensor()
+        self.val_target = torch.cuda.FloatTensor()
+        self.val_output_sig = torch.cuda.FloatTensor()
+    # Define the validation step
+    def validation_step(self, batch, batch_nb):
+        x, y = batch
+        # loss = torch.nn.functional.binary_cross_entropy(input=self.forward(x), target=y)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(input=self.forward(x), target=y)
+        self.val_output = torch.cat((self.val_output, self.forward(x)), dim=0)
+        self.val_target = torch.cat((self.val_target, y), dim=0)
+        # Apply sigmoid function to forward
+        self.val_output_sig = torch.cat((self.val_output_sig, torch.sigmoid(self.forward(x))), dim=0)
+        self.log('batch_val_loss', loss)
+        return {'batch_val_loss': loss}
+    # Define the validation post epoch end step
+    def validation_epoch_end(self, outputs):
+        avg_val_loss = torch.stack([x["batch_val_loss"] for x in outputs]).mean()
+        self.log('avg_val_loss', avg_val_loss, prog_bar=True)
+        val_auroc = auroc(
+            pred=self.val_output.view(-1)
+            , target=self.val_target.view(-1)
+        )
+        val_sig_auroc = auroc(
+            pred=self.val_output_sig.view(-1)
+            , target=self.val_target.view(-1)
+        )
+        self.log('val_auroc', val_auroc, prog_bar=True)
+        self.log('val_sig_auroc', val_sig_auroc, prog_bar=True)
+
+# Define objective function to optimize within Optuna study
+def NNet_Objective(trial):
+    # Ensure directory is created for each trial of study
+    os.mkdir(
+        path=os.path.join(
+            'Classifier Studies/'
+            , '20201022_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        )
+    )
+
+    # Create trial model checkpoint
+    TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
+        filepath=os.path.join(
+            'Classifier Studies/'
+            , '20201022_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , '{epoch}'
+        )
+        , monitor='val_auroc'
+        , mode='max'
+    )
+    # Instantiate the MetricsCallback
+    Metrics_Callback = MetricsCallback(
+        monitor='val_auroc'
+        , mode='max'
+    )
+
+    # Instantiate the PyTorch Lightning Trainer
+    PL_Trainer = pl.Trainer(
+        logger=CSVLogger(save_dir=os.path.join(
+            'Classifier Studies/'
+            , '20201022_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+        ))
+        , checkpoint_callback=TrialCheckpointCallback
+        , max_epochs=500
+        , gpus=[Device]
+        , callbacks=[
+            Metrics_Callback
+            , pl.callbacks.EarlyStopping(
+                patience=10
+                , verbose=False
+                , mode='max'
+                , monitor='val_auroc'
+            )
+            , optuna.integration.PyTorchLightningPruningCallback(trial, monitor='val_auroc')
+        ]
+        , progress_bar_refresh_rate=0
+    )
+
+    # Instantiate the PyTorch Lightning module
+    Model = NNet_Lightning(trial)
+
+    # Save Model architecture to respective trial folder
+    torch.save(
+        obj=Model
+        , f=os.path.join(
+            'Classifier Studies/'
+            , '20201022_Classifier_Study/'
+            , 'trial_{}'.format(trial.number)
+            , 'Model.sav'
+        )
+    )
+
+    # Use Trainer to fit the model
+    PL_Trainer.fit(
+        model=Model
+        , train_dataloader=train_dl
+        , val_dataloaders=valid_dl
+    )
+
+    # Return the best auroc score from all epochs
+    return Metrics_Callback.best_metric.item()
+
+# Run the study
+Classifier_Study = Run_Study(
+    study_name='Classifier'
+    , study_db='sqlite:///Classifier Studies/20201022_Classifier_Study/20201022_Classifier_Study.db'
+    , objective_fx=NNet_Objective
+    , direction = 'maximize'
+    , n_trials=10
     , n_jobs=Cores
     , n_startup_trials=20
     , n_warmup_steps=20
