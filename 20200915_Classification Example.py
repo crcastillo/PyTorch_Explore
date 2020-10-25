@@ -7,6 +7,8 @@
 
     Notes:
     - Updated for pytorch-lightning 1.0.2
+    - Created NNet_Objective_Class that embeds PyTorch Lightning model/trainer, EarlyStopping, MetricsCallback, and
+    Optuna pruning hooks to be used within objective function for Optuna HPO
 """
 
 # <editor-fold desc="Import relevant modules, load dataset, split Test/Train/Valid">
@@ -40,7 +42,7 @@ import PreProcessing
 # Set parameters
 Random_Seed = 123
 Test_Proportion = 0.2
-Cores = np.int(multiprocessing.cpu_count() / 4)
+Cores = np.int(multiprocessing.cpu_count() / 2)
 Device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 batch_size = 64
 
@@ -223,6 +225,89 @@ class MetricsCallback(pl.Callback):
             if self.metrics[-1][self.monitor] < self.best_metric:
                 self.best_metric = self.metrics[-1][self.monitor]
 
+# Define objective function to optimize within Optuna study
+class NNet_Objective_Class(object):
+    def __init__(self, pl_model, monitor: str, mode: str, folder_path: str, max_epochs: int, es_patience: int, device
+                 , train_dl, valid_dl):
+        self.pl_model = pl_model
+        self.monitor = monitor
+        self.mode = mode
+        self.folder_path = folder_path
+        self.max_epochs = max_epochs
+        self.es_patience = es_patience
+        self.device = device
+        self.train_dl = train_dl
+        self.valid_dl = valid_dl
+
+    def __call__(self, trial: optuna.trial.Trial):
+        # Ensure directory is created for each trial of study
+        os.mkdir(
+            path=os.path.join(
+                self.folder_path
+                , 'trial_{}'.format(trial.number)
+            )
+        )
+
+        # Create trial model checkpoint
+        TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
+            filepath=os.path.join(
+                self.folder_path
+                , 'trial_{}'.format(trial.number)
+                , '{epoch}'
+            )
+            , monitor=self.monitor
+            , mode=self.mode
+        )
+        # Instantiate the MetricsCallback
+        Metrics_Callback = MetricsCallback(
+            monitor=self.monitor
+            , mode=self.mode
+        )
+
+        # Instantiate the PyTorch Lightning Trainer
+        PL_Trainer = pl.Trainer(
+            logger=CSVLogger(save_dir=os.path.join(
+                self.folder_path
+                , 'trial_{}'.format(trial.number)
+            ))
+            , checkpoint_callback=TrialCheckpointCallback
+            , max_epochs=self.max_epochs
+            , gpus=[self.device]
+            , callbacks=[
+                Metrics_Callback
+                , pl.callbacks.EarlyStopping(
+                    patience=self.es_patience
+                    , verbose=False
+                    , mode=self.mode
+                    , monitor=self.monitor
+                )
+                , optuna.integration.PyTorchLightningPruningCallback(trial, monitor=self.monitor)
+            ]
+            , progress_bar_refresh_rate=0
+        )
+
+        # Instantiate the PyTorch Lightning module
+        Model = self.pl_model(trial)
+
+        # Save Model architecture to respective trial folder
+        torch.save(
+            obj=Model
+            , f=os.path.join(
+                self.folder_path
+                , 'trial_{}'.format(trial.number)
+                , 'Model.sav'
+            )
+        )
+
+        # Use Trainer to fit the model
+        PL_Trainer.fit(
+            model=Model
+            , train_dataloader=self.train_dl
+            , val_dataloaders=self.valid_dl
+        )
+
+        # Return the best auroc score from all epochs
+        return Metrics_Callback.best_metric.item()
 
 # </editor-fold>
 
@@ -963,95 +1048,31 @@ class NNet_Lightning(pl.LightningModule):
         self.log('val_auroc', val_auroc, prog_bar=True)
         self.log('val_sig_auroc', val_sig_auroc, prog_bar=True)
 
-# Define objective function to optimize within Optuna study
-def NNet_Objective(trial):
-    # Ensure directory is created for each trial of study
-    os.mkdir(
-        path=os.path.join(
-            'Classifier Studies/'
-            , '20201022_Classifier_Study/'
-            , 'trial_{}'.format(trial.number)
-        )
-    )
-
-    # Create trial model checkpoint
-    TrialCheckpointCallback = pl.callbacks.ModelCheckpoint(
-        filepath=os.path.join(
-            'Classifier Studies/'
-            , '20201022_Classifier_Study/'
-            , 'trial_{}'.format(trial.number)
-            , '{epoch}'
-        )
-        , monitor='val_auroc'
-        , mode='max'
-    )
-    # Instantiate the MetricsCallback
-    Metrics_Callback = MetricsCallback(
-        monitor='val_auroc'
-        , mode='max'
-    )
-
-    # Instantiate the PyTorch Lightning Trainer
-    PL_Trainer = pl.Trainer(
-        logger=CSVLogger(save_dir=os.path.join(
-            'Classifier Studies/'
-            , '20201022_Classifier_Study/'
-            , 'trial_{}'.format(trial.number)
-        ))
-        , checkpoint_callback=TrialCheckpointCallback
-        , max_epochs=500
-        , gpus=[Device]
-        , callbacks=[
-            Metrics_Callback
-            , pl.callbacks.EarlyStopping(
-                patience=10
-                , verbose=False
-                , mode='max'
-                , monitor='val_auroc'
-            )
-            , optuna.integration.PyTorchLightningPruningCallback(trial, monitor='val_auroc')
-        ]
-        , progress_bar_refresh_rate=0
-    )
-
-    # Instantiate the PyTorch Lightning module
-    Model = NNet_Lightning(trial)
-
-    # Save Model architecture to respective trial folder
-    torch.save(
-        obj=Model
-        , f=os.path.join(
-            'Classifier Studies/'
-            , '20201022_Classifier_Study/'
-            , 'trial_{}'.format(trial.number)
-            , 'Model.sav'
-        )
-    )
-
-    # Use Trainer to fit the model
-    PL_Trainer.fit(
-        model=Model
-        , train_dataloader=train_dl
-        , val_dataloaders=valid_dl
-    )
-
-    # Return the best auroc score from all epochs
-    return Metrics_Callback.best_metric.item()
 
 # Run the study
 Classifier_Study = Run_Study(
     study_name='Classifier'
-    , study_db='sqlite:///Classifier Studies/20201022_Classifier_Study/20201022_Classifier_Study.db'
-    , objective_fx=NNet_Objective
+    , study_db='sqlite:///Classifier Studies/20201024_Classifier_Study/20201024_Classifier_Study.db'
+    , objective_fx=NNet_Objective_Class(
+        pl_model=NNet_Lightning
+        , monitor='val_auroc'
+        , mode='max'
+        , folder_path='Classifier Studies/20201024_Classifier_Study/'
+        , max_epochs=100
+        , es_patience=10
+        , device=Device
+        , train_dl=train_dl
+        , valid_dl=valid_dl
+    )
     , direction = 'maximize'
-    , n_trials=10
+    , n_trials=12
     , n_jobs=Cores
-    , n_startup_trials=20
+    , n_startup_trials=4
     , n_warmup_steps=20
     , interval_steps=1
     , seed=Random_Seed
 )
 
-# Best Avg Valid_Loss = 0.?
+# Best Valid_AUROC = 0.931387
 
 # </editor-fold>
