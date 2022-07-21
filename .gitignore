@@ -1,3 +1,8 @@
-/Classify_Example_net.sav
+*.sav
 /lightning_logs/
-/Classify_Example_PL_net.sav
+__pycache__/
+.idea/
+**/Classifier Checkpoint/
+**/Classifier Studies/
+**/Linear Regression Studies/
+**/Survival Analysis Studies/
